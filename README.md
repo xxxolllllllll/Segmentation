@@ -1,8 +1,11 @@
 ## Clone Repo & Get Assests 
 
-git clone https://github.com/xxxolllllllll/Segmentation.git
-cd Segmentation
-bash scripts/download_assets.sh
+git clone https://github.com/xxxolllllllll/Segmentation.git  
+
+cd Segmentation  
+
+bash scripts/download_assets.sh  
+
 
 ## Linux/WSL Repro Package
 
