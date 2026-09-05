@@ -1,4 +1,10 @@
-# Linux/WSL Repro Package
+## Clone Repo & Get Assests 
+
+git clone https://github.com/xxxolllllllll/Segmentation.git
+cd Segmentation
+bash scripts/download_assets.sh
+
+## Linux/WSL Repro Package
 
 This directory is a cleaned, Linux/WSL-oriented experiment package for reproducing the small-paper training and evaluation chain. It keeps only the Stage A / Stage B / Stage C / evaluation code needed for the paper and standardizes paths around `data/`, `weights/`, and `runs/`.
 
