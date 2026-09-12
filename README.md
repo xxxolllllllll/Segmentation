@@ -71,16 +71,43 @@ bash scripts/setup_wsl.sh
 bash scripts/run_kfold.sh
 ```
 
-编排器 `scripts/run_kfold_experiments.py` 依次完成：建折 → Stage A（全局）→ 每折 Stage B →
-每折各学生实验 → 每折评估 → 汇总 `mean ± std` 报告（`runs/kfold/reports/`）。
+编排器 `scripts/run_kfold_experiments.py` 依次完成：建折 → Stage A（全局，按需）→ 每折 Stage B（按需）→
+每折所选学生实验 → 每折评估 → 汇总 `mean ± std` 报告（`runs/kfold/reports/`）。
 各步骤幂等：已存在的 checkpoint / metrics 会被复用。
 
-常用环境变量覆盖：
+### 选择性运行 `EXPERIMENT_FILTER`
+
+用 `EXPERIMENT_FILTER`（逗号分隔的实验 ID）只跑部分实验；教师阶段会自动按需执行：
+
+- `S0`：无教师 → **跳过 Stage A 与 Stage B**。
+- `S1` / `S1_attn`：裸 DINOv3 教师 → 跳过 Stage A/B。
+- `S2` / `S2_attn`：Stage A 教师 → 只跑 Stage A。
+- `S3` / `S3_attn`：Stage A+B 教师 → 跑 Stage A 与每折 Stage B。
+
+只跑 S0（服务器示例，数据在外部卷）：
 
 ```bash
+cd <PROJECT_ROOT>
+DATA_ROOT=/mnt/volume3/home/zgt/data \
+EXPERIMENT_FILTER=S0 \
+YOLO_WEIGHTS=weights/yolo11m-seg.pt \
+NUM_WORKERS=4 PREFETCH_FACTOR=2 \
+bash scripts/run_kfold.sh
+```
+
+- `LABELME_ALL_DIR` 由 `DATA_ROOT` 推导为 `$DATA_ROOT/labelme/all`。
+- 评估会在**现有 checkpoint 集合扩大时自动重跑**并累加进报告，因此可以分批运行（先 S0，后
+  `EXPERIMENT_FILTER=S0,S1,S1_attn,S2,S2_attn,S3,S3_attn` 补齐），不会重复训练已完成的模型。
+
+常用环境变量：
+
+```bash
+DATA_ROOT=/mnt/volume3/home/zgt/data \
+RUNS_ROOT=$PWD/runs \
 KFOLD_K=5 KFOLD_SEED=42 KFOLD_MAX_EPOCHS=100 KFOLD_EARLY_STOP_PATIENCE=10 \
-KFOLD_VAL_RATIO=0.10 KFOLD_VAL_STRIDE=512 NUM_WORKERS=4 \
-LABELME_ALL_DIR=/path/to/labelme/all STAGE_A_EXTERNAL_DIR=/path/to/zenodo_pool \
+KFOLD_VAL_RATIO=0.10 KFOLD_VAL_STRIDE=512 KFOLD_BATCH_SIZE=2 \
+NUM_WORKERS=4 PREFETCH_FACTOR=2 \
+EXPERIMENT_FILTER=S0 \
 bash scripts/run_kfold.sh
 ```
 

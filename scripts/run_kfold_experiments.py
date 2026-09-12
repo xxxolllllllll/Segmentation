@@ -2,13 +2,22 @@
 """5-fold cross-validation orchestrator for the crack-segmentation distillation grid.
 
 Pipeline:
-  1. Build a deterministic K-fold split over ``data/labelme/all`` (cached manifest).
-  2. Train Stage A (global, self-supervised) on the external unlabeled pool.
+  1. Build a deterministic K-fold split over ``<DATA_ROOT>/labelme/all`` (cached manifest).
+  2. Train Stage A (global, self-supervised) on the external unlabeled pool, only
+     when a selected experiment needs a Stage-A/B teacher.
   3. Per fold f (0..K-1):
-     a. Train the Stage A+B teacher on the 4 training folds (adapters frozen).
-     b. Distill/train students S0/S1/S1_attn/S2/S2_attn/S3/S3_attn on the same 4 folds.
-     c. Evaluate every model on the held-out fold f.
+     a. Train the Stage A+B teacher on the 4 training folds (adapters frozen), only
+        when a selected experiment needs a Stage-B teacher.
+     b. Distill/train the selected students on the same 4 folds.
+     c. Evaluate every trained model on the held-out fold f (re-run when new
+        checkpoints appear, so metrics accumulate across incremental runs).
   4. Aggregate mean +- std over folds and write reports.
+
+Selection:
+  ``EXPERIMENT_FILTER`` (comma-separated paper ids) limits which experiments run,
+  e.g. ``EXPERIMENT_FILTER=S0`` or ``EXPERIMENT_FILTER=S0,S1,S3``. Default: all.
+  Data root is ``DATA_ROOT`` (default ``<project>/data``); outputs go under
+  ``RUNS_ROOT`` (default ``<project>/runs``).
 
 All steps are idempotent: existing checkpoints / metrics are reused.
 """
@@ -90,6 +99,42 @@ EXPERIMENTS = [
     Experiment("S3", "stage_b", 0.5, 0.0),
     Experiment("S3_attn", "stage_b", 0.5, 0.2),
 ]
+
+
+def selected_experiments() -> list[Experiment]:
+    """Experiments to run this invocation, from EXPERIMENT_FILTER (default: all)."""
+    spec = os.environ.get("EXPERIMENT_FILTER", "").strip()
+    if not spec:
+        return list(EXPERIMENTS)
+    by_id = {e.paper_id: e for e in EXPERIMENTS}
+    wanted = [x.strip() for x in spec.replace(" ", ",").split(",") if x.strip()]
+    missing = [w for w in wanted if w not in by_id]
+    if missing:
+        raise ValueError(f"Unknown EXPERIMENT_FILTER ids: {missing}. Available: {list(by_id)}")
+    return [by_id[w] for w in wanted]
+
+
+def experiment_uses_teacher(exp: Experiment) -> bool:
+    return exp.lambda_feat > 0.0 or exp.lambda_attn > 0.0
+
+
+def teacher_stage_requirements(experiments: list[Experiment]) -> tuple[bool, bool]:
+    """Return (need_stage_a, need_stage_b) for the selected experiments."""
+    teach = [e for e in experiments if experiment_uses_teacher(e)]
+    need_stage_a = any(e.teacher_mode in ("stage_a", "stage_b") for e in teach)
+    need_stage_b = any(e.teacher_mode == "stage_b" for e in teach)
+    return need_stage_a, need_stage_b
+
+
+def available_models(fold: int) -> list[str]:
+    """All checkpoints currently present for a fold (students + optional stage_b)."""
+    models: list[str] = []
+    for exp in EXPERIMENTS:
+        if (exp_dir(fold, exp.paper_id) / "best.pt").is_file():
+            models.append(exp.paper_id)
+    if (stage_b_dir(fold) / "best.pt").is_file():
+        models.append("stage_b")
+    return models
 
 
 def run_cmd(cmd: list[str], *, cwd: Path = ROOT) -> None:
@@ -236,25 +281,41 @@ def run_stage_c(fold: int, exp: Experiment, stage_b_ckpt: Path | None) -> Path:
     return best
 
 
-def run_eval(fold: int, stage_b_ckpt: Path, exp_ids: list[str]) -> Path:
+def run_eval(fold: int) -> Path | None:
+    models = available_models(fold)
     out = fold_dir(fold) / "eval"
     metrics_path = out / "metrics.json"
+    if not models:
+        print(f"[eval] fold={fold} skip (no checkpoints found)", flush=True)
+        return metrics_path if metrics_path.is_file() else None
+
     if metrics_path.is_file():
-        print(f"[eval] fold={fold} skip (metrics.json exists)", flush=True)
-        return metrics_path
+        try:
+            existing = json.loads(metrics_path.read_text(encoding="utf-8"))
+            results = existing.get("models") or existing.get("results") or []
+            present = {r["model"] for r in results}
+        except Exception:
+            present = set()
+        if set(models) <= present:
+            print(f"[eval] fold={fold} skip (metrics.json covers {sorted(models)})", flush=True)
+            return metrics_path
+
     out.mkdir(parents=True, exist_ok=True)
     cmd = [
         PYTHON, str(EVAL),
         "--labelme-dir", str(LABELME_ALL_DIR),
         "--output-dir", str(out),
-        "--stage-b-ckpt", str(stage_b_ckpt),
-        "--teacher-weights", str(DINO_WEIGHTS),
         "--fold-split", str(KFOLD_SPLIT), "--fold", str(fold),
         "--stride", str(VAL_STRIDE),
         "--device", DEVICE,
     ]
-    for exp_id in exp_ids:
-        cmd += ["--student-ckpt", f"{exp_id}={exp_dir(fold, exp_id) / 'best.pt'}"]
+    if "stage_b" in models:
+        cmd += ["--stage-b-ckpt", str(stage_b_dir(fold) / "best.pt")]
+        cmd += ["--teacher-weights", str(DINO_WEIGHTS)]
+    for model in models:
+        if model == "stage_b":
+            continue
+        cmd += ["--student-ckpt", f"{model}={exp_dir(fold, model) / 'best.pt'}"]
     run_cmd(cmd)
     return metrics_path
 
@@ -274,8 +335,29 @@ def read_model_micro(metrics_path: Path, model: str) -> dict[str, float]:
     raise KeyError(f"model {model} not found in {metrics_path}")
 
 
+def discover_report_models() -> list[str]:
+    """Models present in every fold's eval metrics, in canonical order."""
+    per_fold: list[set[str]] = []
+    for fold in range(K):
+        metrics_path = fold_dir(fold) / "eval" / "metrics.json"
+        if not metrics_path.is_file():
+            continue
+        data = json.loads(metrics_path.read_text(encoding="utf-8"))
+        results = data.get("models") or data.get("results") or []
+        per_fold.append({r["model"] for r in results})
+    if not per_fold:
+        return []
+    common = set.intersection(*per_fold)
+    ordered = [e.paper_id for e in EXPERIMENTS] + ["stage_b"]
+    return [m for m in ordered if m in common]
+
+
 def aggregate() -> None:
-    model_names = [e.paper_id for e in EXPERIMENTS] + ["stage_b"]
+    model_names = discover_report_models()
+    if not model_names:
+        print("[aggregate] no eval metrics found for all folds; nothing to aggregate", flush=True)
+        return
+    print(f"[aggregate] models={model_names}", flush=True)
     seed_rows: list[dict] = []
     summary_rows: list[dict] = []
     for model in model_names:
@@ -336,15 +418,27 @@ def aggregate() -> None:
 
 def main() -> int:
     KFOLD_ROOT.mkdir(parents=True, exist_ok=True)
-    build_folds()
-    run_stage_a()
+    experiments = selected_experiments()
+    need_stage_a, need_stage_b = teacher_stage_requirements(experiments)
+    print(
+        f"[kfold] experiments={[e.paper_id for e in experiments]} "
+        f"need_stage_a={need_stage_a} need_stage_b={need_stage_b}",
+        flush=True,
+    )
 
-    exp_ids = [e.paper_id for e in EXPERIMENTS]
+    build_folds()
+    if need_stage_a:
+        run_stage_a()
+    else:
+        print("[stage-a] skip (no selected experiment uses a Stage-A/B teacher)", flush=True)
+    if not need_stage_b:
+        print("[stage-b] skip (no selected experiment uses a Stage-B teacher)", flush=True)
+
     for fold in range(K):
-        stage_b_ckpt = run_stage_b(fold)
-        for exp in EXPERIMENTS:
+        stage_b_ckpt = run_stage_b(fold) if need_stage_b else None
+        for exp in experiments:
             run_stage_c(fold, exp, stage_b_ckpt if exp.teacher_mode == "stage_b" else None)
-        run_eval(fold, stage_b_ckpt, exp_ids)
+        run_eval(fold)
 
     aggregate()
     return 0
