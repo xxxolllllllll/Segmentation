@@ -59,7 +59,9 @@ class PairRandomAugment:
 
 
 def default_train_transforms() -> Callable[[Image.Image, Image.Image], tuple[Image.Image, Image.Image]]:
-    return PairRandomAugment()
+    from augment import geometric_augment_pil
+
+    return geometric_augment_pil
 
 
 def _resolve_image_path(images_dir: Path, stem: str) -> Path:

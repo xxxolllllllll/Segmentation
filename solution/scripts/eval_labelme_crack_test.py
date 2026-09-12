@@ -41,6 +41,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from checkpoint_io import torch_load_compat
+from folds import load_folds
 from models.dino_stage_b_unet import DINOv3StageBUNet
 from models.yolo_unet_semseg import YoloUNetSemanticStudent
 from scripts.labelme_crack_copy_paste import parse_csv_set, rasterize_masks, read_labelme
@@ -109,6 +110,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--component-labels", type=str, default="component,wood")
     p.add_argument("--imgsz", type=int, default=0, help="Window size; 0 uses checkpoint/config default 1024")
     p.add_argument("--stride", type=int, default=512)
+    p.add_argument("--fold-split", type=Path, default=None, help="K-fold manifest JSON; evaluate only the held-out fold.")
+    p.add_argument("--fold", type=int, default=0, help="Held-out fold index (0-based) when --fold-split is set.")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--save-pred-masks", action="store_true")
     return p.parse_args()
@@ -402,6 +405,10 @@ def main() -> int:
     component_labels = parse_csv_set(args.component_labels)
 
     ann_paths = list_test_samples(labelme_dir)
+    if args.fold_split is not None:
+        split = load_folds(args.fold_split.expanduser().resolve())
+        fold_samples = split["folds"][int(args.fold)]
+        ann_paths = [Path(s["json"]) for s in fold_samples]
     if not ann_paths:
         raise RuntimeError(f"No LabelMe JSON under {labelme_dir}")
 

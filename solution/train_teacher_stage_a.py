@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import json
 import math
 import os
@@ -53,6 +54,15 @@ def clamp_num_workers_windows(args: argparse.Namespace) -> None:
     if os.name == "nt" and args.num_workers != 0:
         print(f"[info] Windows detected, forcing num_workers from {args.num_workers} to 0")
         args.num_workers = 0
+
+
+def worker_init_fn(worker_id: int) -> None:
+    # Forked DataLoader workers inherit the CUDA-context memory mappings of the
+    # main process. Pin each worker to a single thread so OpenMP/MKL/blas don't
+    # oversubscribe CPUs and inflate per-worker memory further.
+    torch.set_num_threads(1)
+    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[key] = "1"
 
 
 def _parse_float_pair(text: str, name: str) -> tuple[float, float]:
@@ -255,6 +265,25 @@ def _resize_with_aspect_and_pad(x: torch.Tensor, target_size: int) -> torch.Tens
     return x
 
 
+def _pil_resize_with_aspect_and_pad(img: Image.Image, target_size: int) -> Image.Image:
+    """PIL version of aspect-preserving resize+pad to a fixed square.
+
+    Doing the resize in PIL (rather than resizing an arbitrary-size torch tensor)
+    keeps DataLoader workers from creating/fragmenting many variable-size CPU
+    tensors, which otherwise makes worker RSS grow without bound.
+    """
+    w, h = img.size
+    if h <= 0 or w <= 0:
+        raise ValueError(f"Invalid image size: {(w, h)}")
+    scale = min(target_size / h, target_size / w)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = img.resize((new_w, new_h), Image.BILINEAR)
+    canvas = Image.new("RGB", (target_size, target_size), (0, 0, 0))
+    canvas.paste(resized, ((target_size - new_w) // 2, (target_size - new_h) // 2))
+    return canvas
+
+
 def _sample_crop_box(
     width: int,
     height: int,
@@ -316,52 +345,68 @@ def _sample_crop_box(
     return left, top, left + crop_w, top + crop_h
 
 
-def _build_crop_transform(
-    *,
-    spec: CropSpec,
-    elongated_ratio_threshold: float,
-    color_jitter_strength: float = 0.4,
-    include_ann_prob: float = 0.8,
-    max_crop_aspect: float = 1.6,
-):
-    from torchvision import transforms as T
-    from torchvision.transforms import functional as TF
+class CropTransform:
+    """Picklable single-crop transform.
 
-    cj = T.ColorJitter(
-        brightness=0.8 * color_jitter_strength,
-        contrast=0.8 * color_jitter_strength,
-        saturation=0.8 * color_jitter_strength,
-        hue=0.2 * color_jitter_strength,
-    )
-    blur = T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))
-    gray = T.Grayscale(num_output_channels=3)
+    Implemented as a module-level class (instead of a closure) so it can be
+    pickled when the DataLoader uses the ``spawn`` multiprocessing context,
+    which avoids fork-inheriting the parent CUDA context in each worker.
+    """
 
-    def _transform(image: Image.Image, ann_boxes: Sequence[tuple[int, int, int, int]] | None = None) -> torch.Tensor:
+    def __init__(
+        self,
+        *,
+        spec: CropSpec,
+        elongated_ratio_threshold: float,
+        color_jitter_strength: float = 0.4,
+        include_ann_prob: float = 0.8,
+        max_crop_aspect: float = 1.6,
+    ) -> None:
+        from torchvision import transforms as T
+
+        self.spec = spec
+        self.elongated_ratio_threshold = float(elongated_ratio_threshold)
+        self.include_ann_prob = float(include_ann_prob)
+        self.max_crop_aspect = float(max_crop_aspect)
+        self.cj = T.ColorJitter(
+            brightness=0.8 * color_jitter_strength,
+            contrast=0.8 * color_jitter_strength,
+            saturation=0.8 * color_jitter_strength,
+            hue=0.2 * color_jitter_strength,
+        )
+        self.blur = T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))
+        self.gray = T.Grayscale(num_output_channels=3)
+
+    def __call__(
+        self,
+        image: Image.Image,
+        ann_boxes: Sequence[tuple[int, int, int, int]] | None = None,
+    ) -> torch.Tensor:
+        from torchvision.transforms import functional as TF
+
         crop_box = _sample_crop_box(
             image.width,
             image.height,
-            spec=spec,
-            elongated_ratio_threshold=elongated_ratio_threshold,
+            spec=self.spec,
+            elongated_ratio_threshold=self.elongated_ratio_threshold,
             ann_boxes=ann_boxes,
-            include_ann_prob=include_ann_prob,
-            max_crop_aspect=max_crop_aspect,
+            include_ann_prob=self.include_ann_prob,
+            max_crop_aspect=self.max_crop_aspect,
         )
         crop = image.crop(crop_box)
         if random.random() < 0.5:
             crop = TF.hflip(crop)
         if random.random() < 0.8:
-            crop = cj(crop)
+            crop = self.cj(crop)
         if random.random() < 0.2:
-            crop = gray(crop)
+            crop = self.gray(crop)
         if random.random() < 0.3:
-            crop = blur(crop)
+            crop = self.blur(crop)
 
+        crop = _pil_resize_with_aspect_and_pad(crop, self.spec.target_size)
         x = TF.to_tensor(crop)
-        x = _resize_with_aspect_and_pad(x, spec.target_size)
         x = TF.normalize(x, mean=IMAGENET_MEAN, std=IMAGENET_STD)
         return x
-
-    return _transform
 
 
 class MultiCropAug:
@@ -381,19 +426,19 @@ class MultiCropAug:
         self.num_global_crops = num_global_crops
         self.num_mid_crops = num_mid_crops
         self.num_local_crops = num_local_crops
-        self.global_tf = _build_crop_transform(
+        self.global_tf = CropTransform(
             spec=global_spec,
             elongated_ratio_threshold=elongated_ratio_threshold,
             include_ann_prob=include_ann_prob,
             max_crop_aspect=max_crop_aspect,
         )
-        self.mid_tf = _build_crop_transform(
+        self.mid_tf = CropTransform(
             spec=mid_spec,
             elongated_ratio_threshold=elongated_ratio_threshold,
             include_ann_prob=include_ann_prob,
             max_crop_aspect=max_crop_aspect,
         )
-        self.local_tf = _build_crop_transform(
+        self.local_tf = CropTransform(
             spec=local_spec,
             elongated_ratio_threshold=elongated_ratio_threshold,
             include_ann_prob=include_ann_prob,
@@ -665,6 +710,23 @@ def cosine_ema_momentum(epoch: int, epochs: int, base_m: float) -> float:
     return 1.0 - 0.5 * (1.0 - base_m) * (1.0 + math.cos(math.pi * epoch / max(1, epochs - 1)))
 
 
+LOSS_STEP_FIELDS = ["global_step", "epoch", "loss"]
+LOSS_EPOCH_FIELDS = ["epoch", "loss", "ema_m"]
+
+
+def _prepare_csv(path: Path, fields: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return
+    with path.open("w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(fields)
+
+
+def _append_csv_row(path: Path, row: list[object]) -> None:
+    with path.open("a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(row)
+
+
 def _save_checkpoint(
     output_dir: Path,
     epoch: int,
@@ -742,6 +804,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--teacher-temp", type=float, default=0.04)
     p.add_argument("--center-momentum", type=float, default=0.9)
     p.add_argument("--save-every", type=int, default=10)
+    p.add_argument("--log-every", type=int, default=100, help="Print per-step loss every N steps (0 disables step-level printing)")
+    p.add_argument("--max-steps", type=int, default=0, help="Debug: limit steps per epoch (0 = all)")
     p.add_argument("--viz-crops-dir", type=Path, default=None, help="Optional directory to save multi-crop previews")
     p.add_argument("--viz-samples", type=int, default=0, help="How many samples to preview before training")
     p.add_argument("--preview-only", action="store_true", help="Only export multi-crop previews, then exit")
@@ -824,6 +888,11 @@ def main() -> None:
     if args.num_workers > 0:
         loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
+        loader_kwargs["worker_init_fn"] = worker_init_fn
+        # spawn (not fork) so workers do NOT inherit the CUDA context of the
+        # main process. fork-inherited CUDA mappings cost ~3GB RAM per worker
+        # and cause OOM on WSL. Requires picklable dataset/transform.
+        loader_kwargs["multiprocessing_context"] = "spawn"
     loader = DataLoader(ds, **loader_kwargs)
 
     if len(loader) == 0:
@@ -861,11 +930,17 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[info] output dir: {args.output_dir}")
 
+    loss_steps_csv = args.output_dir / "loss_steps.csv"
+    loss_epoch_csv = args.output_dir / "epoch_metrics.csv"
+    _prepare_csv(loss_steps_csv, LOSS_STEP_FIELDS)
+    _prepare_csv(loss_epoch_csv, LOSS_EPOCH_FIELDS)
+
     global_views = args.num_global_crops
     all_views = args.num_global_crops + args.num_mid_crops + args.num_local_crops
     if global_views < 1 or all_views <= global_views:
         raise ValueError("Need at least 1 global crop and at least one additional crop.")
 
+    global_step = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
         model.backbone.eval()
@@ -874,6 +949,8 @@ def main() -> None:
         ema_m = cosine_ema_momentum(epoch - 1, args.epochs, args.ema_momentum)
 
         for crops in loader:
+            if args.max_steps > 0 and n_steps >= args.max_steps:
+                break
             # default collate stacks to list[tensor(B,C,H,W)] with len = n_views
             if not isinstance(crops, list):
                 crops = list(crops)
@@ -912,11 +989,21 @@ def main() -> None:
                 criterion.update_center(teacher_logits)
                 ema.update_from(model.adapters, model.projector, momentum=ema_m)
 
-            running += float(loss.detach().cpu().item())
+            step_loss = float(loss.detach().cpu().item())
+            running += step_loss
             n_steps += 1
+            global_step += 1
+            _append_csv_row(loss_steps_csv, [global_step, epoch, f"{step_loss:.6f}"])
+            if args.log_every > 0 and n_steps % args.log_every == 0:
+                print(
+                    f"[epoch {epoch:03d}/{args.epochs}] step {n_steps}/{len(loader)} "
+                    f"loss={running / n_steps:.6f} ema_m={ema_m:.6f}",
+                    flush=True,
+                )
 
         epoch_loss = running / max(1, n_steps)
         print(f"[epoch {epoch:03d}/{args.epochs}] loss={epoch_loss:.6f} ema_m={ema_m:.6f}")
+        _append_csv_row(loss_epoch_csv, [epoch, f"{epoch_loss:.6f}", f"{ema_m:.6f}"])
 
         if (epoch % args.save_every == 0) or (epoch == args.epochs):
             path = _save_checkpoint(args.output_dir, epoch, model, ema, optimizer, args)

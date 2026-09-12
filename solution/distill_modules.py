@@ -33,14 +33,24 @@ class StudentChannelAlign(nn.Module):
     默认通道须与所用检测模型 neck 一致（如 yolo11m 常见 P3/P4/P5=256/512/1024；小模型可能是 192/384/512）。
     """
 
-    def __init__(self, in_channels: Sequence[int] = (256, 512, 512), out_channels: int = 768):
+    def __init__(self, in_channels: Sequence[int] = (256, 512, 512), out_channels: int | Sequence[int] = 768):
         """
         参数:
             in_channels: 三元组，依次为 P3、P4、P5 的输入通道数。
-            out_channels: 投影后的通道数，需与教师特征通道数 C_t 一致（如 768）。
+            out_channels: 投影后的通道数，需与教师目标特征通道数一致。
+                可为单一 int（三层相同，如 768/1536），也可为三元组（逐层不同，
+                如 Stage-B bridge 的 (128,192,256)）。
         """
         super().__init__()
-        self.proj = nn.ModuleList([nn.Conv2d(c, out_channels, kernel_size=1) for c in in_channels])
+        if isinstance(out_channels, int):
+            out_channels = (out_channels, out_channels, out_channels)
+        out_channels = tuple(int(c) for c in out_channels)
+        if len(out_channels) != 3:
+            raise ValueError("out_channels must be an int or a 3-tuple")
+        self.out_channels = out_channels
+        self.proj = nn.ModuleList(
+            [nn.Conv2d(c, oc, kernel_size=1) for c, oc in zip(in_channels, out_channels)]
+        )
 
     def forward(self, p3: torch.Tensor, p4: torch.Tensor, p5: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -175,6 +185,62 @@ class AdaptiveTeacherFusion(nn.Module):
         t2 = self._fuse_one(teacher_feats[2], teacher_feats[3], target_sizes[1], self.weight_heads[1])
         t3 = self._fuse_one(teacher_feats[4], teacher_feats[5], target_sizes[2], self.weight_heads[2])
         return t1, t2, t3
+
+
+class ConcatTeacherTargets(nn.Module):
+    """
+    相邻教师特征层拼接作为蒸馏目标（S1/S2 使用）。
+
+    对六张教师特征 [F3,F4,F7,F8,F11,F12]，逐对在通道维拼接后插值到学生
+    P3/P4/P5 的空间尺寸：
+        [F3‖F4] -> P3, [F7‖F8] -> P4, [F11‖F12] -> P5。
+    拼接后单路通道数为 2*C（如 ViT-B 为 1536）。无可学习参数。
+    """
+
+    def forward(
+        self,
+        teacher_feats: Sequence[torch.Tensor],
+        target_sizes: Sequence[Tuple[int, int]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if len(teacher_feats) != 6:
+            raise ValueError("teacher_feats must be length 6: [F3,F4,F7,F8,F11,F12].")
+        if len(target_sizes) != 3:
+            raise ValueError("target_sizes must be length 3 for P3/P4/P5.")
+
+        outs = []
+        for pair_idx, hw in zip((0, 2, 4), target_sizes):
+            fs = AdaptiveTeacherFusion._to_nchw(teacher_feats[pair_idx])
+            fd = AdaptiveTeacherFusion._to_nchw(teacher_feats[pair_idx + 1])
+            fs = F.interpolate(fs, size=hw, mode="bilinear", align_corners=False)
+            fd = F.interpolate(fd, size=hw, mode="bilinear", align_corners=False)
+            outs.append(torch.cat([fs, fd], dim=1))
+        return outs[0], outs[1], outs[2]
+
+
+class BridgeTeacherTargets(nn.Module):
+    """
+    Stage-B bridge 特征作为蒸馏目标（S3/S3_attn 使用）。
+
+    输入三张 bridge 特征图（均为 H/16，通道 128/192/256），映射到学生
+    P3/P4/P5 尺度：low->P3（上采样）、mid->P4（同尺度）、deep->P5（下采样）。
+    无可学习参数。
+    """
+
+    def forward(
+        self,
+        bridge_feats: Sequence[torch.Tensor],
+        target_sizes: Sequence[Tuple[int, int]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if len(bridge_feats) != 3:
+            raise ValueError("bridge_feats must be length 3: [low, mid, deep].")
+        if len(target_sizes) != 3:
+            raise ValueError("target_sizes must be length 3 for P3/P4/P5.")
+
+        low, mid, deep = bridge_feats
+        low = F.interpolate(low, size=target_sizes[0], mode="bilinear", align_corners=False)
+        mid = F.interpolate(mid, size=target_sizes[1], mode="bilinear", align_corners=False)
+        deep = F.interpolate(deep, size=target_sizes[2], mode="bilinear", align_corners=False)
+        return low, mid, deep
 
 
 class SingleLayerTeacherTargets(nn.Module):

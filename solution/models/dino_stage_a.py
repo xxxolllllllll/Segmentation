@@ -141,6 +141,8 @@ class DINOv3StageAModel(nn.Module):
 
         self.backbone = _load_vit_backbone(self.weights_dir, pretrained=pretrained, device=device)
         self.hidden_size = int(self.backbone.config.hidden_size)
+        self.patch_size = int(getattr(self.backbone.config, "patch_size", 16))
+        self.num_register_tokens = int(getattr(self.backbone.config, "num_register_tokens", 0))
 
         self.adapters = nn.ModuleDict(
             {str(i): BottleneckResidualAdapter(self.hidden_size, bottleneck_dim, adapter_dropout) for i in self.adapter_indices}
@@ -187,6 +189,40 @@ class DINOv3StageAModel(nn.Module):
             raise ValueError("adapted_hidden_states cannot be empty")
         cls_tokens = [h[:, 0, :] for h in adapted_hidden_states]
         return torch.stack(cls_tokens, dim=0).mean(dim=0)
+
+    def _tokens_to_map(self, tokens: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """[B, seq, C] -> patch tokens -> [B, C, H, W] (H=H_in/patch, W=W_in/patch)."""
+        b, seq, c = tokens.shape
+        gh, gw = h // self.patch_size, w // self.patch_size
+        n_patch = gh * gw
+        n_skip = 1 + self.num_register_tokens
+        if seq >= n_skip + n_patch:
+            patch_tokens = tokens[:, n_skip : n_skip + n_patch, :]
+        elif seq == n_patch:
+            patch_tokens = tokens
+        elif seq > n_patch:
+            patch_tokens = tokens[:, -n_patch:, :]
+        else:
+            raise RuntimeError(f"Unexpected token shape: seq={seq}, needed patches={n_patch}")
+        return patch_tokens.reshape(b, gh, gw, c).permute(0, 3, 1, 2).contiguous()
+
+    @torch.no_grad()
+    def extract_adapted_feature_maps(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Return Stage-A adapted DINO feature maps for the adapter indices.
+
+        Used as the S2/S2_attn distillation target. Applies the (frozen) adapters
+        to the backbone hidden states and reshapes the patch tokens to a grid.
+        """
+        b, _, h, w = x.shape
+        if h % self.patch_size != 0 or w % self.patch_size != 0:
+            raise ValueError(f"Input H/W must be divisible by patch_size={self.patch_size}, got {(h, w)}")
+        hs = self.backbone_hidden_states(x)
+        maps = []
+        for idx in self.adapter_indices:
+            if idx >= len(hs):
+                raise RuntimeError(f"hidden_states length={len(hs)} missing index={idx}")
+            maps.append(self._tokens_to_map(self.adapters[str(idx)](hs[idx]), h=h, w=w))
+        return maps
 
     def project_from_hidden_states(self, hidden_states: Sequence[torch.Tensor]) -> torch.Tensor:
         adapted = self.adapt_hidden_states(hidden_states)

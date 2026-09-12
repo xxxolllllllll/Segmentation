@@ -35,7 +35,14 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from checkpoint_io import torch_load_compat  # noqa: E402
-from distill_modules import AdaptiveTeacherFusion, StudentChannelAlign  # noqa: E402
+from augment import geometric_augment  # noqa: E402
+from distill_modules import (  # noqa: E402
+    BridgeTeacherTargets,
+    ConcatTeacherTargets,
+    StudentChannelAlign,
+)
+from folds import fold_train_val_test, load_folds, to_tuples  # noqa: E402
+from models.dino_stage_a import DINOv3StageAModel  # noqa: E402
 from models.dino_stage_b_unet import DINOv3StageBUNet  # noqa: E402
 from models.teacher_vit import build_teacher  # noqa: E402
 from models.yolo_unet_semseg import YoloUNetSemanticStudent  # noqa: E402
@@ -47,6 +54,12 @@ from scripts.labelme_crack_copy_paste import (  # noqa: E402
     rasterize_masks,
     read_labelme,
     transform_instance,
+)
+from val_eval import (  # noqa: E402
+    aggregate_micro,
+    build_gt_masks,
+    compute_crack_metrics,
+    predict_student_mask,
 )
 
 
@@ -472,10 +485,10 @@ class LabelMeStageCDataset(Dataset):
         mask_p[crack_p] = 1
         mask_p[ignore_p] = IGNORE_INDEX
 
-        if self.train and self.rng.random() < 0.5:
-            image_p = np.ascontiguousarray(image_p[:, ::-1])
-            mask_p = np.ascontiguousarray(mask_p[:, ::-1])
-            component_p = np.ascontiguousarray(component_p[:, ::-1])
+        if self.train:
+            image_p, [mask_p, component_p] = geometric_augment(
+                image_p, [mask_p, component_p], prob=0.5, rng=self.rng
+            )
 
         pil_img = Image.fromarray(image_p)
         pil_mask = Image.fromarray(mask_p, mode="L")
@@ -650,11 +663,45 @@ def load_raw_vit_teacher(args: argparse.Namespace, device: torch.device) -> nn.M
     return teacher
 
 
+def load_stage_a_teacher(args: argparse.Namespace, device: torch.device) -> DINOv3StageAModel:
+    ckpt_path = args.teacher_stage_a_ckpt.expanduser().resolve()
+    teacher_weights = args.teacher_weights.strip()
+    if not teacher_weights:
+        raise ValueError("--teacher-weights is required when --teacher-mode stage_a")
+    ckpt = torch_load_compat(ckpt_path, map_location="cpu", weights_only=False)
+    adapter_indices = tuple(int(i) for i in ckpt.get("adapter_indices", (3, 4, 7, 8, 11, 12)))
+    ckpt_args = ckpt.get("args") or {}
+    bottleneck = int(ckpt_args.get("adapter_bottleneck", 64))
+    teacher = DINOv3StageAModel(
+        weights_dir=teacher_weights,
+        pretrained=not args.teacher_no_pretrained,
+        device=device,
+        adapter_indices=adapter_indices,
+        bottleneck_dim=bottleneck,
+    ).to(device)
+    sd = ckpt.get("teacher_adapters_ema") or ckpt.get("student_adapters")
+    if sd is None:
+        raise KeyError("Stage-A checkpoint missing adapter state dict")
+    missing, unexpected = teacher.adapters.load_state_dict(sd, strict=False)
+    if missing:
+        print(f"[stageA-teacher] adapter missing keys: {missing}", flush=True)
+    if unexpected:
+        print(f"[stageA-teacher] adapter unexpected keys: {unexpected}", flush=True)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+    return teacher
+
+
 def load_teacher(args: argparse.Namespace, device: torch.device) -> nn.Module:
     if args.teacher_mode == "stage_b":
         if args.teacher_stage_b_ckpt is None:
             raise ValueError("--teacher-stage-b-ckpt is required when --teacher-mode stage_b")
         return load_stage_b_teacher(args, device=device)
+    if args.teacher_mode == "stage_a":
+        if args.teacher_stage_a_ckpt is None:
+            raise ValueError("--teacher-stage-a-ckpt is required when --teacher-mode stage_a")
+        return load_stage_a_teacher(args, device=device)
     if args.teacher_mode == "raw_vit":
         return load_raw_vit_teacher(args, device=device)
     raise ValueError(f"Unsupported teacher mode: {args.teacher_mode}")
@@ -668,8 +715,10 @@ def teacher_feature_dim(teacher: nn.Module) -> int:
     raise AttributeError("Teacher is missing hidden_size/embed_dim, cannot infer distillation channels")
 
 
-def extract_teacher_feature_maps(teacher: nn.Module, x: torch.Tensor) -> Sequence[torch.Tensor]:
-    if hasattr(teacher, "extract_adapted_feature_maps"):
+def extract_teacher_feature_maps(teacher: nn.Module, x: torch.Tensor, mode: str) -> Sequence[torch.Tensor]:
+    if mode == "stage_b":
+        return teacher.extract_bridge_feature_maps(x)
+    if mode == "stage_a":
         return teacher.extract_adapted_feature_maps(x)
     return teacher(x)
 
@@ -707,7 +756,8 @@ def compute_distill_losses(
     student_feats: Sequence[torch.Tensor],
     teacher: nn.Module,
     align: StudentChannelAlign,
-    fusion: nn.Module,
+    targets_fn: nn.Module,
+    teacher_mode: str,
     teacher_img_size: int,
     lambdas: Sequence[float],
     attn_gamma: float,
@@ -717,8 +767,8 @@ def compute_distill_losses(
     x_t = F.interpolate(images_01, size=(teacher_img_size, teacher_img_size), mode="bilinear", align_corners=False)
     x_t = imagenet_normalize(x_t)
     with torch.no_grad():
-        t_feats = extract_teacher_feature_maps(teacher, x_t)
-    t_targets = fusion(t_feats, target_sizes)
+        t_feats = extract_teacher_feature_maps(teacher, x_t, teacher_mode)
+    t_targets = targets_fn(t_feats, target_sizes)
 
     feat_total = torch.zeros((), device=images_01.device, dtype=s_feats[0].dtype)
     attn_total = torch.zeros_like(feat_total)
@@ -752,8 +802,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--curated-dir", type=Path, default=None, help="Alias/fallback for --curated-labelme-dir")
     p.add_argument("--images-dir", type=Path, default=None, help="Image dir corresponding to LabelMe JSONs; default: labelme dir")
     p.add_argument("--student-weights", type=str, default="solution/yolo11m-seg.pt")
-    p.add_argument("--teacher-mode", type=str, default="stage_b", choices=("stage_b", "raw_vit"))
+    p.add_argument("--teacher-mode", type=str, default="stage_b", choices=("stage_b", "stage_a", "raw_vit"))
     p.add_argument("--teacher-stage-b-ckpt", type=Path, default=None)
+    p.add_argument("--teacher-stage-a-ckpt", type=Path, default=None)
     p.add_argument("--teacher-weights", type=str, default="")
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--num-classes", type=int, default=2)
@@ -785,12 +836,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--copy-paste-scale-max", type=float, default=1.1)
     p.add_argument("--copy-paste-alpha-dilate", type=int, default=3)
     p.add_argument("--copy-paste-alpha-blur", type=int, default=7)
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size-curated", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--val-ratio", type=float, default=0.05)
+    p.add_argument("--val-ratio", type=float, default=0.10)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--fold-split", type=Path, default=None, help="K-fold manifest JSON (folds.json). Overrides --curated-labelme-dir discovery.")
+    p.add_argument("--fold", type=int, default=0, help="Held-out fold index (0-based) when --fold-split is set.")
+    p.add_argument("--early-stop-patience", type=int, default=10, help="Early stop on val crack IoU patience.")
+    p.add_argument("--val-stride", type=int, default=512, help="Sliding-window stride for image-level val IoU.")
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--persistent-workers", action="store_true", help="Keep DataLoader workers alive between epochs (num_workers>0)")
     p.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor (num_workers>0 only)")
@@ -826,6 +881,8 @@ def main() -> None:
         raise ValueError("--imgsz and --teacher-img-size must be divisible by 16")
     if use_teacher and args.teacher_mode == "stage_b" and args.teacher_stage_b_ckpt is None:
         raise ValueError("Set --teacher-stage-b-ckpt when --teacher-mode stage_b")
+    if use_teacher and args.teacher_mode == "stage_a" and args.teacher_stage_a_ckpt is None:
+        raise ValueError("Set --teacher-stage-a-ckpt when --teacher-mode stage_a")
     if use_teacher and args.teacher_mode == "raw_vit" and not args.teacher_weights.strip():
         raise ValueError("Set --teacher-weights when --teacher-mode raw_vit")
 
@@ -844,10 +901,19 @@ def main() -> None:
     device = torch.device(args.device)
     use_amp = device.type == "cuda" and not args.no_amp
 
-    all_samples, embedded, skipped = build_labelme_samples(labelme_dir, images_dir)
-    if not all_samples:
-        raise RuntimeError(f"No LabelMe annotations with matching images under {labelme_dir}")
-    train_samples, val_samples = split_samples(all_samples, args.val_ratio, args.seed)
+    if args.fold_split is not None:
+        split = load_folds(args.fold_split.expanduser().resolve())
+        train_dicts, val_dicts, _test = fold_train_val_test(
+            split, int(args.fold), float(args.val_ratio), int(args.seed)
+        )
+        train_samples = to_tuples(train_dicts)
+        val_samples = to_tuples(val_dicts)
+        embedded = skipped = 0
+    else:
+        all_samples, embedded, skipped = build_labelme_samples(labelme_dir, images_dir)
+        if not all_samples:
+            raise RuntimeError(f"No LabelMe annotations with matching images under {labelme_dir}")
+        train_samples, val_samples = split_samples(all_samples, args.val_ratio, args.seed)
 
     crack_labels = parse_csv_set(args.crack_labels)
     ignore_labels = parse_csv_set(args.ignore_labels)
@@ -870,20 +936,10 @@ def main() -> None:
         window_stride=args.window_stride,
         discard_no_component=discard_no_component,
     )
-    val_src = val_samples if val_samples else train_samples[: max(1, len(train_samples) // 5)]
-    val_entries, val_pos = build_window_entries(
-        val_src,
-        crack_labels=crack_labels,
-        ignore_labels=ignore_labels,
-        component_labels=component_labels,
-        window_size=window_size,
-        window_stride=args.window_stride,
-        discard_no_component=discard_no_component,
-    )
     if not train_entries:
         raise RuntimeError("No training patches. Check component labels or use --keep-outside-component-patches.")
-    if not val_entries:
-        raise RuntimeError("No validation patches. Check component labels or use --keep-outside-component-patches.")
+    if not val_samples:
+        val_samples = train_samples[: max(1, len(train_samples) // 5)]
 
     train_ds = LabelMeStageCDataset(
         train_entries,
@@ -898,36 +954,6 @@ def main() -> None:
         ncp_labels=ncp_labels,
         copy_paste_prob=args.copy_paste_prob,
         copy_paste_num_pastes=args.copy_paste_num_pastes,
-        copy_paste_attempt_multiplier=args.copy_paste_attempt_multiplier,
-        copy_paste_min_crack_area=args.copy_paste_min_crack_area,
-        copy_paste_bbox_padding=args.copy_paste_bbox_padding,
-        copy_paste_search_radius=args.copy_paste_search_radius,
-        copy_paste_max_tries=args.copy_paste_max_tries,
-        copy_paste_inside_component_threshold=args.copy_paste_inside_component_threshold,
-        copy_paste_max_crack_overlap=args.copy_paste_max_crack_overlap,
-        copy_paste_max_other_overlap=args.copy_paste_max_other_overlap,
-        copy_paste_brightness_mean_threshold=args.copy_paste_brightness_mean_threshold,
-        copy_paste_brightness_std_threshold=args.copy_paste_brightness_std_threshold,
-        copy_paste_texture_angle_threshold=args.copy_paste_texture_angle_threshold,
-        copy_paste_max_rotate_deg=args.copy_paste_max_rotate_deg,
-        copy_paste_scale_min=args.copy_paste_scale_min,
-        copy_paste_scale_max=args.copy_paste_scale_max,
-        copy_paste_alpha_dilate=args.copy_paste_alpha_dilate,
-        copy_paste_alpha_blur=args.copy_paste_alpha_blur,
-    )
-    val_ds = LabelMeStageCDataset(
-        val_entries,
-        val_pos,
-        crack_labels=crack_labels,
-        ignore_labels=ignore_labels,
-        component_labels=component_labels,
-        window_size=window_size,
-        imgsz=args.imgsz,
-        train=False,
-        seed=args.seed + 1,
-        ncp_labels=ncp_labels,
-        copy_paste_prob=0.0,
-        copy_paste_num_pastes=0,
         copy_paste_attempt_multiplier=args.copy_paste_attempt_multiplier,
         copy_paste_min_crack_area=args.copy_paste_min_crack_area,
         copy_paste_bbox_padding=args.copy_paste_bbox_padding,
@@ -975,15 +1001,6 @@ def main() -> None:
         drop_last=True,
         **loader_kwargs,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size_curated,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        collate_fn=collate_curated,
-        **loader_kwargs,
-    )
     if len(train_loader) == 0:
         raise RuntimeError("Train loader empty; lower --batch-size-curated")
 
@@ -1002,13 +1019,18 @@ def main() -> None:
 
     teacher: nn.Module | None = None
     align: StudentChannelAlign | None = None
-    fusion: AdaptiveTeacherFusion | None = None
+    targets_fn: nn.Module | None = None
     teacher_dim: int | None = None
     if use_teacher:
         teacher = load_teacher(args, device=device)
         teacher_dim = teacher_feature_dim(teacher)
-        align = StudentChannelAlign(in_channels=(c3, c4, c5), out_channels=teacher_dim).to(device)
-        fusion = AdaptiveTeacherFusion(channels=teacher_dim).to(device)
+        if args.teacher_mode == "stage_b":
+            align_out = (128, 192, 256)
+            targets_fn = BridgeTeacherTargets().to(device)
+        else:
+            align_out = (2 * teacher_dim, 2 * teacher_dim, 2 * teacher_dim)
+            targets_fn = ConcatTeacherTargets().to(device)
+        align = StudentChannelAlign(in_channels=(c3, c4, c5), out_channels=align_out).to(device)
 
     class_weights = parse_float_list(args.class_weights, args.num_classes, "--class-weights")
     ce_weight = torch.tensor(class_weights, device=device, dtype=torch.float32) if class_weights else None
@@ -1018,22 +1040,21 @@ def main() -> None:
     params = list(student.parameters())
     if align is not None:
         params += list(align.parameters())
-    if fusion is not None:
-        params += list(fusion.parameters())
+    if targets_fn is not None:
+        params += list(targets_fn.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     lambdas = (args.lambda_l1, args.lambda_l2, args.lambda_l3)
 
     start_epoch = 1
-    best_val = float("inf")
+    best_val = -1.0
+    patience_counter = 0
     if args.resume is not None:
         resume_path = args.resume.expanduser().resolve()
         ckpt = torch_load_compat(resume_path, map_location="cpu", weights_only=False)
         student.load_state_dict(ckpt["student"], strict=True)
         if align is not None and "align" in ckpt:
             align.load_state_dict(ckpt["align"], strict=True)
-        if fusion is not None and "fusion" in ckpt:
-            fusion.load_state_dict(ckpt["fusion"], strict=True)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scaler" in ckpt and isinstance(ckpt["scaler"], dict):
@@ -1053,16 +1074,15 @@ def main() -> None:
         "amp": use_amp,
         "window_size_resolved": window_size,
         "train_patches": len(train_ds),
-        "val_patches": len(val_ds),
+        "val_patches": len(val_samples),
         "train_positive_patches": int(sum(train_ds.is_positive_mask)),
-        "val_positive_patches": int(sum(val_ds.is_positive_mask)),
     }
     (args.output_dir / "config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     epoch_metrics_csv = args.output_dir / "epoch_metrics.csv"
     prepare_epoch_metrics_csv(epoch_metrics_csv, start_epoch=start_epoch)
 
     print(
-        f"[StageC] train_patches={len(train_ds)} val_patches={len(val_ds)} "
+        f"[StageC] train_patches={len(train_ds)} val_patches={len(val_samples)} "
         f"positive={sum(train_ds.is_positive_mask)} window={window_size} stride={args.window_stride} "
         f"copy_paste_prob={args.copy_paste_prob} copy_paste_num={args.copy_paste_num_pastes} "
         f"teacher_enabled={use_teacher} teacher_mode={args.teacher_mode if use_teacher else 'disabled'} teacher_dim={teacher_dim} "
@@ -1074,8 +1094,8 @@ def main() -> None:
         student.train()
         if align is not None:
             align.train()
-        if fusion is not None:
-            fusion.train()
+        if targets_fn is not None:
+            targets_fn.train()
         running = {"ce": 0.0, "dice": 0.0, "feat": 0.0, "attn": 0.0, "total": 0.0}
         n_batches = 0
         n_train = len(train_loader) if args.max_steps <= 0 else min(len(train_loader), args.max_steps)
@@ -1096,7 +1116,7 @@ def main() -> None:
                 feat = torch.zeros((), device=device, dtype=logits.dtype)
                 attn = torch.zeros((), device=device, dtype=logits.dtype)
                 if use_teacher:
-                    assert teacher is not None and align is not None and fusion is not None
+                    assert teacher is not None and align is not None and targets_fn is not None
                     feat, attn = compute_distill_losses(
                         images_01=img,
                         mask=mask,
@@ -1104,7 +1124,8 @@ def main() -> None:
                         student_feats=feats,
                         teacher=teacher,
                         align=align,
-                        fusion=fusion,
+                        targets_fn=targets_fn,
+                        teacher_mode=args.teacher_mode,
                         teacher_img_size=args.teacher_img_size,
                         lambdas=lambdas,
                         attn_gamma=args.attn_crack_gamma,
@@ -1136,30 +1157,49 @@ def main() -> None:
                 )
 
         student.eval()
-        val_losses: list[float] = []
+        val_metrics = []
         with torch.no_grad():
-            for vi, batch in enumerate(val_loader, start=1):
+            for vi, (ann_path, img_path) in enumerate(val_samples, start=1):
                 if args.max_val_batches > 0 and vi > args.max_val_batches:
                     break
-                img = batch["img"].to(device, non_blocking=True)
-                mask = batch["mask"].to(device, non_blocking=True)
-                with amp_autocast(device, use_amp):
-                    logits, _feats = student(img)
-                    val_loss = args.lambda_ce * ce_loss_fn(logits, mask) + args.lambda_dice * dice_loss_fn(logits, mask)
-                val_losses.append(float(val_loss.detach().cpu()))
-        mean_val = float(np.mean(val_losses)) if val_losses else 0.0
+                data = read_labelme(ann_path)
+                img = load_labelme_image(data, img_path)
+                w, h = img.size
+                image_rgb = np.asarray(img, dtype=np.uint8)
+                gt, valid = build_gt_masks(
+                    data,
+                    (w, h),
+                    crack_labels=crack_labels,
+                    ignore_labels=ignore_labels,
+                    component_labels=component_labels,
+                )
+                if not bool(valid.any()):
+                    continue
+                pred = predict_student_mask(
+                    student,
+                    image_rgb,
+                    imgsz=args.imgsz,
+                    stride=args.val_stride,
+                    num_classes=args.num_classes,
+                    device=device,
+                )
+                val_metrics.append(compute_crack_metrics(gt, pred, valid))
+        mean_val_iou = aggregate_micro(val_metrics).iou if val_metrics else 0.0
 
         print(
             f"Epoch {epoch}/{args.epochs} train_total={running['total']/max(n_batches,1):.4f} "
             f"train_ce={running['ce']/max(n_batches,1):.4f} train_dice={running['dice']/max(n_batches,1):.4f} "
             f"train_feat={running['feat']/max(n_batches,1):.4f} train_attn={running['attn']/max(n_batches,1):.4f} "
-            f"val_seg={mean_val:.4f}",
+            f"val_iou={mean_val_iou:.4f}",
             flush=True,
         )
 
-        improved = mean_val <= best_val
+        improved = mean_val_iou > best_val
         if improved:
-            best_val = mean_val
+            best_val = mean_val_iou
+            patience_counter = 0
+        else:
+            patience_counter += 1
         append_epoch_metrics_csv(
             epoch_metrics_csv,
             {
@@ -1169,7 +1209,7 @@ def main() -> None:
                 "train_dice": running["dice"] / max(n_batches, 1),
                 "train_feat": running["feat"] / max(n_batches, 1),
                 "train_attn": running["attn"] / max(n_batches, 1),
-                "val_seg": mean_val,
+                "val_seg": mean_val_iou,
                 "best_val": best_val,
             },
         )
@@ -1177,7 +1217,6 @@ def main() -> None:
             "epoch": epoch,
             "student": student.state_dict(),
             "align": align.state_dict() if align is not None else None,
-            "fusion": fusion.state_dict() if fusion is not None else None,
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict() if use_amp else None,
             "best_val": best_val,
@@ -1189,9 +1228,12 @@ def main() -> None:
         torch.save(ckpt, args.output_dir / "last.pt")
         if improved:
             torch.save(ckpt, args.output_dir / "best.pt")
-            print(f"[ckpt] best updated: val_seg={best_val:.4f}", flush=True)
+            print(f"[ckpt] best updated: val_iou={best_val:.4f}", flush=True)
+        if patience_counter >= args.early_stop_patience:
+            print(f"[early-stop] no improvement for {args.early_stop_patience} epochs, stopping at epoch {epoch}", flush=True)
+            break
 
-    print(f"[done] best val_seg={best_val:.4f} output={args.output_dir}", flush=True)
+    print(f"[done] best val_iou={best_val:.4f} output={args.output_dir}", flush=True)
 
 
 if __name__ == "__main__":

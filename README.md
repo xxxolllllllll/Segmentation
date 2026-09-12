@@ -1,113 +1,136 @@
-## Clone Repo & Get Assests 
+# 古建筑木构件裂缝分割 · 跨架构视觉大模型知识蒸馏（5 折交叉验证版）
 
-git clone https://github.com/xxxolllllllll/Segmentation.git  
-  
-cd Segmentation  
+面向少样本古建筑木构件裂缝分割的跨架构视觉大模型知识蒸馏方法复现实验包。
 
-bash scripts/download_assets.sh  
-
-
-## Linux/WSL Repro Package
-
-This directory is a cleaned, Linux/WSL-oriented experiment package for reproducing the small-paper training and evaluation chain. It keeps only the Stage A / Stage B / Stage C / evaluation code needed for the paper and standardizes paths around `data/`, `weights/`, and `runs/`.
-
-## Standard Layout
-
-Use the following layout under `paper_repro/`:
+## 目录结构
 
 ```text
 paper_repro/
   data/
-    stage_a/                  # raw images or LabelMe JSON roots for Stage A
+    stage_a_external/        # Stage A 自监督无标签数据（Zenodo 外部池，非 labelme 标注数据）
     labelme/
-      curated/                # optional alias; in your current setup this equals trainval
-      trainval/               # LabelMe train+val JSONs and their images
-      test/                   # LabelMe test JSONs and their images
+      all/                   # 全部标注样本（json+image），5 折划分的数据源
   weights/
     dinov3-vitb16-pretrain-lvd1689m/
     yolo11m-seg.pt
   runs/
-  solution/
-  scripts/
+    kfold/                   # K 折实验产物
+      folds.json             # 5 折划分清单（唯一事实来源）
+      fold0/…fold4/          # 每折的 stage_b 教师 + 各学生实验 + eval
+      reports/               # 均值±标准差汇总
+    stage_a/                 # 全局 Stage A 自监督训练产物
+  solution/                  # 训练/评估脚本
+  scripts/                   # shell 包装与 K 折编排器
 ```
 
-The shell wrappers default to this layout, but you can override paths with environment variables such as `DATA_ROOT`, `WEIGHTS_ROOT`, `RUNS_ROOT`, `LABELME_CURATED_DIR`, `LABELME_TRAINVAL_DIR`, and `LABELME_TEST_DIR`. If `LABELME_CURATED_DIR` is not set, it falls back to `LABELME_TRAINVAL_DIR`.
+## 实验矩阵（每折 K=5）
 
-## Paper Experiment IDs
+| ID | 教师 | 蒸馏特征来源 | 蒸馏损失 |
+|----|------|--------------|----------|
+| S0 | 无 | — | — |
+| S1 | 裸 DINOv3（无 A/B） | h3‖h4, h7‖h8, h11‖h12 拼接 | feat |
+| S1_attn | 裸 DINOv3 | 同 S1 | feat + attn |
+| S2 | Stage A（仅 adapter，无 fuse/bridge） | adapter 输出拼接 | feat |
+| S2_attn | Stage A | 同 S2 | feat + attn |
+| S3 | Stage A + B（Stage B 冻结 adapter） | bridge_low/mid/deep | feat |
+| S3_attn | Stage A + B | bridge_low/mid/deep | feat + attn |
 
-The wrappers in this folder use the paper's final numbering:
+- **S4（copy-paste）已删除**，copy-paste 增益实验暂不开展。
+- 蒸馏对齐：`S1/S2` 将相邻教师层拼接后与 P3/P4/P5 对齐（通道 2×768=1536）；`S3` 将
+  `bridge_low(128)/mid(192)/deep(256)` 映射到 P3/P4/P5。
+- 教师特征来源（`dino_stage_a.py::extract_adapted_feature_maps`、
+  `dino_stage_b_unet.py::extract_bridge_feature_maps`）。
 
-- `S0`: student-only baseline, no teacher distillation.
-- `S1`: raw `DINOv3` teacher feature distillation.
-- `S2`: Stage A + Stage B adapted teacher feature distillation.
-- `S3`: `S2` plus crack-attention distillation.
-- `S4`: `S3` plus student-side Copy-Paste augmentation.
+## K 折协议
 
-Legacy mapping in the original project:
+- 在 `data/labelme/all` 上做 **K=5** 确定性划分（seed 42），清单缓存于 `runs/kfold/folds.json`，
+  教师训练、学生蒸馏、评估三者共享同一份划分。
+- 对每一折 `f`（0..4）：测试集 = 折 f；训练集 = 其余 4 折；再从训练集内划出 **~10%** 作为
+  早停验证集。
+- 教师-学生对应关系：`S3/S3_attn` 使用「同折的 Stage B 教师」蒸馏学生（教师与学生使用相同的
+  4 折训练）；`S1/S1_attn/S2/S2_attn` 教师与折无关（裸 DINOv3 / 全局 Stage A）。
+- Stage A 为全局一次性自监督训练，数据来自外部无标签池 `data/stage_a_external/`。
 
-- paper `S2` corresponds to the old code/output naming `S3`.
-- paper `S3` corresponds to the old code/output naming `S4`.
-- paper `S4` corresponds to the old code/output naming `S5`.
-- the old "stage-B-only teacher" ablation is kept as an optional `generic` Stage B run, but it is not part of the final paper numbering.
+## 训练协议（统一）
 
-## Install on WSL
+- 最大轮次 `--epochs 100`，**早停基于验证集裂缝 IoU**（patience 10），best.pt 按 val IoU 选取。
+- 训练数据每轮以 0.5 概率施加简单几何变换（90° 整数倍旋转 + 水平翻转），Stage B/C 共用
+  `solution/augment.py`。
+- Stage B 教师训练 **冻结 adapter**（仅训练 decoder / PairAdaptiveFuse / bridge），保留
+  Stage A 学到的领域特征。
 
-From `paper_repro/`, run:
+## 安装（WSL）
 
 ```bash
 bash scripts/setup_wsl.sh
 ```
 
-The setup script installs `torch`/`torchvision` with CUDA wheels first, then installs the remaining Python dependencies from `requirements-linux.txt`.
-
-## Quick Throughput Benchmark
-
-To verify that WSL gives better Stage C throughput than Windows:
+## 运行 5 折实验
 
 ```bash
-MAX_STEPS=200 NUM_WORKERS=4 bash scripts/benchmark_stage_c.sh
+bash scripts/run_kfold.sh
 ```
 
-This benchmark uses the same Stage C configuration as the adapted-teacher feature-distillation setting, so it is a good proxy for the paper's main training bottleneck.
+编排器 `scripts/run_kfold_experiments.py` 依次完成：建折 → Stage A（全局）→ 每折 Stage B →
+每折各学生实验 → 每折评估 → 汇总 `mean ± std` 报告（`runs/kfold/reports/`）。
+各步骤幂等：已存在的 checkpoint / metrics 会被复用。
 
-## Training Entry Points
+常用环境变量覆盖：
 
 ```bash
-bash scripts/run_stage_a.sh
-bash scripts/run_stage_b.sh full
-bash scripts/run_stage_c_suite.sh S0
-bash scripts/run_stage_c_suite.sh S1
-bash scripts/run_stage_c_suite.sh S2
-bash scripts/run_stage_c_suite.sh S3
-bash scripts/run_stage_c_suite.sh S4
-bash scripts/run_stagec_repeat_stability.sh
+KFOLD_K=5 KFOLD_SEED=42 KFOLD_MAX_EPOCHS=100 KFOLD_EARLY_STOP_PATIENCE=10 \
+KFOLD_VAL_RATIO=0.10 KFOLD_VAL_STRIDE=512 NUM_WORKERS=4 \
+LABELME_ALL_DIR=/path/to/labelme/all STAGE_A_EXTERNAL_DIR=/path/to/zenodo_pool \
+bash scripts/run_kfold.sh
 ```
 
-Optional Stage B ablation without Stage A initialization:
+## 单折/单模型调试
+
+直接调用训练脚本（以折 0、S3 为例）：
 
 ```bash
-bash scripts/run_stage_b.sh generic
+python solution/train_seg_stage_c_mixed.py \
+  --curated-labelme-dir data/labelme/all --images-dir data/labelme/all \
+  --student-weights weights/yolo11m-seg.pt \
+  --teacher-mode stage_b --teacher-weights weights/dinov3-vitb16-pretrain-lvd1689m \
+  --teacher-stage-b-ckpt runs/kfold/fold0/stage_b/best.pt \
+  --output-dir runs/kfold/fold0/S3 \
+  --fold-split runs/kfold/folds.json --fold 0 \
+  --epochs 100 --early-stop-patience 10 --val-ratio 0.10 \
+  --lambda-feat-curated 0.5 --lambda-attn-curated 0.0
 ```
 
-The Stage B / Stage C wrappers forward any extra CLI arguments to the underlying Python script, so short smoke runs such as `bash scripts/run_stage_b.sh generic --max-steps 2 --max-val-batches 1` are supported.
-
-The repeat-stability runner reuses the paper's existing seed-42 checkpoints, resumes any copied `last.pt` runs for seeds `52/62`, evaluates each seed on the test set, and writes `mean +- std` reports under `runs/repeat_stagec_stability/reports/`.
-
-## Evaluation
-
-To evaluate available Stage C checkpoints on the independent test set:
+Stage B 教师（冻结 adapter）：
 
 ```bash
-bash scripts/eval_students.sh
+python solution/train_teacher_stage_b.py \
+  --labelme-dir data/labelme/all --images-dir data/labelme/all \
+  --teacher-weights weights/dinov3-vitb16-pretrain-lvd1689m \
+  --stage-a-ckpt runs/stage_a/stage_a_last.pt \
+  --output-dir runs/kfold/fold0/stage_b \
+  --fold-split runs/kfold/folds.json --fold 0 \
+  --labelme-sliding-window --epochs 100 --early-stop-patience 10
 ```
 
-## Data Assumptions
+## 评估
 
-The LabelMe-based Stage B / Stage C pipeline assumes the following label semantics:
+```bash
+python solution/scripts/eval_labelme_crack_test.py \
+  --labelme-dir data/labelme/all \
+  --fold-split runs/kfold/folds.json --fold 0 \
+  --stage-b-ckpt runs/kfold/fold0/stage_b/best.pt \
+  --teacher-weights weights/dinov3-vitb16-pretrain-lvd1689m \
+  --student-ckpt S3=runs/kfold/fold0/S3/best.pt
+```
 
-- `crack`: foreground crack pixels.
-- `component` or `wood`: valid component region.
-- `ignore`: unreliable region excluded from loss.
-- `ncp`: disables Copy-Paste for that image but is not a prediction class.
+## 数据假设
 
-If your Stage A inputs live outside `data/stage_a/`, set `STAGE_A_ROOT` before running `scripts/run_stage_a.sh`.
+LabelMe 标注语义：
+
+- `crack`：前景裂缝像素。
+- `component` / `wood`：有效构件区域。
+- `ignore`：损失中排除的不可靠区域。
+- 其余（`defect`/`knot`/`decay` 等）作为 copy-paste 的遮挡区域（当前 copy-paste 未启用）。
+- `ncp`：该样本禁用 copy-paste（保留为未来选项）。
+
+有效区域 `V = component ∧ ¬ignore`，早停与最终评估均在此区域上计算裂缝 IoU。

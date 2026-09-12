@@ -5,7 +5,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 EXP="${1:-}"
 if [[ -z "$EXP" ]]; then
-  echo "Usage: bash scripts/run_stage_c_suite.sh [S0|S1|S2|S3|S4]" >&2
+  echo "Usage: bash scripts/run_stage_c_suite.sh [S0|S1|S2|S3]" >&2
   exit 1
 fi
 shift
@@ -57,16 +57,6 @@ case "$EXP" in
     LAMBDA_ATTN="0.2"
     BATCH_SIZE="$S3_BATCH_SIZE"
     EPOCHS="$S3_EPOCHS"
-    ;;
-  S4)
-    need_dir "$LABELME_CURATED_DIR"
-    LABELME_DIR="$LABELME_CURATED_DIR"
-    need_file "$STAGE_B_FULL_CKPT"
-    TEACHER_ARGS+=(--teacher-stage-b-ckpt "$STAGE_B_FULL_CKPT" --teacher-weights "$DINO_WEIGHTS")
-    LAMBDA_ATTN="0.2"
-    COPY_PASTE="$S4_COPY_PASTE_PROB"
-    BATCH_SIZE="$S4_BATCH_SIZE"
-    EPOCHS="$S4_EPOCHS"
     ;;
   *)
     echo "Unsupported experiment: $EXP" >&2

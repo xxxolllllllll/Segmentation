@@ -156,9 +156,10 @@ class DINOv3StageBUNet(nn.Module):
         if unexpected:
             print(f"[stageB] adapter unexpected keys: {unexpected}")
 
-    def trainable_parameters(self):
-        for p in self.adapters.parameters():
-            yield p
+    def trainable_parameters(self, freeze_adapters: bool = True):
+        if not freeze_adapters:
+            for p in self.adapters.parameters():
+                yield p
         for m in (
             self.fuse_low,
             self.fuse_mid,
@@ -175,17 +176,7 @@ class DINOv3StageBUNet(nn.Module):
             for p in m.parameters():
                 yield p
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, _, h, w = x.shape
-        if h % self.patch_size != 0 or w % self.patch_size != 0:
-            raise ValueError(f"Input H/W must be divisible by patch_size={self.patch_size}, got {(h, w)}")
-
-        with torch.no_grad():
-            out = self.backbone(pixel_values=x, output_hidden_states=True, return_dict=True)
-            hs = out.hidden_states
-        if hs is None:
-            raise RuntimeError("Backbone did not return hidden_states")
-
+    def _bridge_maps(self, hs: Sequence[torch.Tensor], h: int, w: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         low3 = self._adapt_map(hs, self._IDX_LOW[0], h, w)
         low4 = self._adapt_map(hs, self._IDX_LOW[1], h, w)
         mid7 = self._adapt_map(hs, self._IDX_MID[0], h, w)
@@ -197,9 +188,42 @@ class DINOv3StageBUNet(nn.Module):
         mid = self.fuse_mid(mid7, mid8)
         deep = self.fuse_deep(dep11, dep12)
 
-        low = self.bridge_low(low)    # H/16
-        mid = self.bridge_mid(mid)    # H/16
-        deep = self.bridge_deep(deep) # H/16
+        low = self.bridge_low(low)    # H/16, 128 ch
+        mid = self.bridge_mid(mid)    # H/16, 192 ch
+        deep = self.bridge_deep(deep)  # H/16, 256 ch
+        return low, mid, deep
+
+    @torch.no_grad()
+    def extract_bridge_feature_maps(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Return Stage-B bridge feature maps [bridge_low, bridge_mid, bridge_deep].
+
+        Used as the S3/S3_attn distillation target. Adapters are frozen, and the
+        fused/bridged maps carry the segmentation-aware representation learned in
+        Stage B.
+        """
+        b, _, h, w = x.shape
+        if h % self.patch_size != 0 or w % self.patch_size != 0:
+            raise ValueError(f"Input H/W must be divisible by patch_size={self.patch_size}, got {(h, w)}")
+        self.eval()
+        out = self.backbone(pixel_values=x, output_hidden_states=True, return_dict=True)
+        hs = out.hidden_states
+        if hs is None:
+            raise RuntimeError("Backbone did not return hidden_states")
+        low, mid, deep = self._bridge_maps(hs, h=h, w=w)
+        return [low, mid, deep]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, _, h, w = x.shape
+        if h % self.patch_size != 0 or w % self.patch_size != 0:
+            raise ValueError(f"Input H/W must be divisible by patch_size={self.patch_size}, got {(h, w)}")
+
+        with torch.no_grad():
+            out = self.backbone(pixel_values=x, output_hidden_states=True, return_dict=True)
+            hs = out.hidden_states
+        if hs is None:
+            raise RuntimeError("Backbone did not return hidden_states")
+
+        low, mid, deep = self._bridge_maps(hs, h, w)
 
         x8 = F.interpolate(deep, scale_factor=2.0, mode="bilinear", align_corners=False)
         s8 = F.interpolate(mid, scale_factor=2.0, mode="bilinear", align_corners=False)

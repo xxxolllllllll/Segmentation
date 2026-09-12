@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from PIL import Image, UnidentifiedImageError
 
 from dataset_seg import SegmentationPatchDataset, default_train_transforms, split_stems
+from folds import fold_train_val_test, load_folds, to_tuples
 from models.dino_stage_b_unet import DINOv3StageBUNet
 from scripts.labelme_crack_copy_paste import (
     alpha_blend_paste,
@@ -34,6 +35,12 @@ from scripts.labelme_crack_copy_paste import (
     rasterize_masks,
     read_labelme,
     transform_instance,
+)
+from val_eval import (
+    aggregate_micro,
+    build_gt_masks,
+    compute_crack_metrics,
+    predict_teacher_mask,
 )
 
 
@@ -175,15 +182,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, default=Path("runs/stage_b_teacher"))
     p.add_argument("--num-classes", type=int, default=4, help="Including background")
     p.add_argument("--imgsz", type=int, default=1024, help="Resize/pad to square; must be divisible by 16")
-    p.add_argument("--epochs", type=int, default=60)
+    p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--persistent-workers", action="store_true", help="Keep DataLoader workers alive between epochs (num_workers>0)")
     p.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor (num_workers>0 only)")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--val-ratio", type=float, default=0.05)
+    p.add_argument("--val-ratio", type=float, default=0.10)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--fold-split", type=Path, default=None, help="K-fold manifest JSON (folds.json). Overrides --labelme-dir discovery.")
+    p.add_argument("--fold", type=int, default=0, help="Held-out fold index (0-based) when --fold-split is set.")
+    p.add_argument("--early-stop-patience", type=int, default=10, help="Early stop on val crack IoU patience.")
+    p.add_argument("--val-stride", type=int, default=512, help="Sliding-window stride for image-level val IoU.")
+    p.add_argument("--train-adapters", action="store_true", help="Also train adapters in Stage B (default: frozen to preserve Stage A features).")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--adapter-bottleneck", type=int, default=64)
     p.add_argument("--adapter-dropout", type=float, default=0.1)
@@ -672,23 +684,31 @@ def main() -> None:
         all_samples: list[tuple[Path, Optional[Path]]] = []
         skipped = 0
         embedded = 0
-        for ann_path in sorted(labelme_dir.glob("*.json")):
-            data = read_labelme(ann_path)
-            img_path = resolve_labelme_image(images_dir, ann_path, data)
-            if img_path is None:
-                if isinstance(data.get("imageData"), str) and data.get("imageData"):
-                    embedded += 1
-                else:
-                    skipped += 1
-                    continue
-            all_samples.append((ann_path, img_path))
-        if not all_samples:
-            raise RuntimeError(f"No LabelMe annotations with matching images under {labelme_dir}")
-        rng = random.Random(args.seed)
-        rng.shuffle(all_samples)
-        n_val = max(1, int(len(all_samples) * args.val_ratio)) if len(all_samples) > 1 else 0
-        val_samples = all_samples[:n_val]
-        train_samples = all_samples[n_val:] or all_samples
+        if args.fold_split is not None:
+            split = load_folds(args.fold_split.expanduser().resolve())
+            train_dicts, val_dicts, _test = fold_train_val_test(
+                split, int(args.fold), float(args.val_ratio), int(args.seed)
+            )
+            train_samples: list[tuple[Path, Optional[Path]]] = to_tuples(train_dicts)
+            val_samples: list[tuple[Path, Optional[Path]]] = to_tuples(val_dicts)
+        else:
+            for ann_path in sorted(labelme_dir.glob("*.json")):
+                data = read_labelme(ann_path)
+                img_path = resolve_labelme_image(images_dir, ann_path, data)
+                if img_path is None:
+                    if isinstance(data.get("imageData"), str) and data.get("imageData"):
+                        embedded += 1
+                    else:
+                        skipped += 1
+                        continue
+                all_samples.append((ann_path, img_path))
+            if not all_samples:
+                raise RuntimeError(f"No LabelMe annotations with matching images under {labelme_dir}")
+            rng = random.Random(args.seed)
+            rng.shuffle(all_samples)
+            n_val = max(1, int(len(all_samples) * args.val_ratio)) if len(all_samples) > 1 else 0
+            val_samples = all_samples[:n_val]
+            train_samples = all_samples[n_val:] or all_samples
         crack_labels = parse_csv_set(args.crack_labels)
         ignore_labels = parse_csv_set(args.ignore_labels)
         component_labels = parse_csv_set(args.component_labels)
@@ -886,7 +906,11 @@ def main() -> None:
         dice_loss = CrackDiceLoss(ignore_index=args.ignore_index)
     else:
         dice_loss = DiceLoss()
-    optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.trainable_parameters(freeze_adapters=not args.train_adapters),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
     use_amp = (not args.no_amp) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -900,7 +924,8 @@ def main() -> None:
             args_dict[k] = v
     (args.output_dir / "config.json").write_text(json.dumps(args_dict, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    best_val = float("inf")
+    best_iou = -1.0
+    patience_counter = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_sum = 0.0
@@ -932,45 +957,84 @@ def main() -> None:
                 )
 
         model.eval()
-        val_sum = 0.0
-        n_val = 0
-        with torch.no_grad():
-            for vi, batch in enumerate(val_loader, start=1):
-                if args.max_val_batches > 0 and vi > args.max_val_batches:
-                    break
-                x, y = resize_batch(batch, args.imgsz)
-                x = x.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    logits = model(x)
-                    l_ce = ce_loss(logits, y)
-                    if args.num_classes == 2:
-                        l_dice = dice_loss(logits, y)
-                    else:
-                        l_dice = dice_loss(logits, y, num_classes=args.num_classes)
-                    loss = args.lambda_ce * l_ce + args.lambda_dice * l_dice
-                val_sum += float(loss.detach().cpu().item())
-                n_val += 1
+        if args.labelme_dir is not None:
+            val_metrics = []
+            with torch.no_grad():
+                for vi, (ann_path, img_path) in enumerate(val_samples, start=1):
+                    if args.max_val_batches > 0 and vi > args.max_val_batches:
+                        break
+                    data = read_labelme(ann_path)
+                    img = load_labelme_image(data, img_path)
+                    w, h = img.size
+                    image_rgb = np.asarray(img, dtype=np.uint8)
+                    gt, valid = build_gt_masks(
+                        data,
+                        (w, h),
+                        crack_labels=crack_labels,
+                        ignore_labels=ignore_labels,
+                        component_labels=component_labels,
+                    )
+                    if not bool(valid.any()):
+                        continue
+                    pred = predict_teacher_mask(
+                        model,
+                        image_rgb,
+                        imgsz=args.imgsz,
+                        stride=args.val_stride,
+                        num_classes=args.num_classes,
+                        device=device,
+                    )
+                    val_metrics.append(compute_crack_metrics(gt, pred, valid))
+            val_iou = aggregate_micro(val_metrics).iou if val_metrics else 0.0
+        else:
+            val_sum = 0.0
+            n_val = 0
+            with torch.no_grad():
+                for vi, batch in enumerate(val_loader, start=1):
+                    if args.max_val_batches > 0 and vi > args.max_val_batches:
+                        break
+                    x, y = resize_batch(batch, args.imgsz)
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        logits = model(x)
+                        l_ce = ce_loss(logits, y)
+                        if args.num_classes == 2:
+                            l_dice = dice_loss(logits, y)
+                        else:
+                            l_dice = dice_loss(logits, y, num_classes=args.num_classes)
+                        loss = args.lambda_ce * l_ce + args.lambda_dice * l_dice
+                    val_sum += float(loss.detach().cpu().item())
+                    n_val += 1
+            val_loss = val_sum / max(1, n_val)
+            # Legacy data-dir path: negate loss so the shared "maximize val_iou"
+            # early-stopping below selects the lowest validation loss.
+            val_iou = -val_loss
 
         train_avg = train_sum / max(1, n_train)
-        val_avg = val_sum / max(1, n_val)
-        print(f"[epoch {epoch:03d}/{args.epochs}] train={train_avg:.6f} val={val_avg:.6f}")
+        print(f"[epoch {epoch:03d}/{args.epochs}] train={train_avg:.6f} val_iou={val_iou:.6f}")
 
         latest = {
             "epoch": epoch,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "train_loss": train_avg,
-            "val_loss": val_avg,
+            "val_iou": val_iou,
             "args": vars(args),
         }
         torch.save(latest, args.output_dir / "last.pt")
-        if val_avg < best_val:
-            best_val = val_avg
+        if val_iou > best_iou:
+            best_iou = val_iou
+            patience_counter = 0
             torch.save(latest, args.output_dir / "best.pt")
-            print(f"[ckpt] best updated: val={best_val:.6f}")
+            print(f"[ckpt] best updated: val_iou={best_iou:.6f}")
+        else:
+            patience_counter += 1
         if epoch % args.save_every == 0:
             torch.save(latest, args.output_dir / f"epoch_{epoch:03d}.pt")
+        if patience_counter >= args.early_stop_patience:
+            print(f"[early-stop] no improvement for {args.early_stop_patience} epochs, stopping at epoch {epoch}")
+            break
 
 
 if __name__ == "__main__":

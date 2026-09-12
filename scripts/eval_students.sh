@@ -17,7 +17,7 @@ ARGS=(
   --teacher-weights "$DINO_WEIGHTS"
 )
 
-for exp in S0 S1 S2 S3 S4; do
+for exp in S0 S1 S2 S3; do
   ckpt="$PAPER_RUN_DIR/$exp/best.pt"
   if [[ -f "$ckpt" ]]; then
     ARGS+=(--student-ckpt "$exp=$ckpt")
