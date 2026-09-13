@@ -88,6 +88,7 @@ class Experiment:
     teacher_mode: str
     lambda_feat: float
     lambda_attn: float
+    student_arch: str = "yolo_unet"
 
 
 EXPERIMENTS = [
@@ -98,6 +99,10 @@ EXPERIMENTS = [
     Experiment("S2_attn", "stage_a", 0.5, 0.2),
     Experiment("S3", "stage_b", 0.5, 0.0),
     Experiment("S3_attn", "stage_b", 0.5, 0.2),
+    # Architecture-comparison baselines (no distillation; same protocol as S0).
+    Experiment("YOLOSeg", "raw_vit", 0.0, 0.0, student_arch="yolo_seg"),
+    Experiment("UNet", "raw_vit", 0.0, 0.0, student_arch="unet"),
+    Experiment("DeepLab", "raw_vit", 0.0, 0.0, student_arch="deeplab"),
 ]
 
 
@@ -248,6 +253,7 @@ def run_stage_c(fold: int, exp: Experiment, stage_b_ckpt: Path | None) -> Path:
         "--curated-labelme-dir", str(LABELME_ALL_DIR),
         "--images-dir", str(LABELME_ALL_DIR),
         "--student-weights", str(YOLO_WEIGHTS),
+        "--student-arch", exp.student_arch,
         "--teacher-mode", exp.teacher_mode,
         "--output-dir", str(out),
         "--num-classes", "2",

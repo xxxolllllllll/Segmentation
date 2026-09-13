@@ -43,7 +43,7 @@ if str(_ROOT) not in sys.path:
 from checkpoint_io import torch_load_compat
 from folds import load_folds
 from models.dino_stage_b_unet import DINOv3StageBUNet
-from models.yolo_unet_semseg import YoloUNetSemanticStudent
+from models.student_factory import build_student
 from scripts.labelme_crack_copy_paste import parse_csv_set, rasterize_masks, read_labelme
 from train_seg_stage_c_mixed import (  # noqa: E402
     effective_ignore,
@@ -256,18 +256,23 @@ def load_stage_b(ckpt_path: Path, teacher_weights: str, device: torch.device) ->
     return model, imgsz
 
 
-def load_student(ckpt_path: Path, device: torch.device) -> tuple[YoloUNetSemanticStudent, int, int]:
+def load_student(ckpt_path: Path, device: torch.device) -> tuple[torch.nn.Module, int, int]:
     ckpt = torch_load_compat(ckpt_path, map_location="cpu", weights_only=False)
     ckpt_args: dict[str, Any] = ckpt.get("args") or {}
     num_classes = int(ckpt_args.get("num_classes", 2))
     imgsz = int(ckpt_args.get("imgsz", 1024))
+    student_arch = str(ckpt_args.get("student_arch", "yolo_unet"))
     student_weights = str(ckpt_args.get("student_weights", "solution/yolo11m-seg.pt"))
     decoder_channels = parse_decoder_channels(str(ckpt_args.get("decoder_channels", "256,192,128,64")))
-    student = YoloUNetSemanticStudent(
-        student_weights,
+    student = build_student(
+        student_arch,
         num_classes=num_classes,
         device=device,
+        student_weights=student_weights,
         decoder_channels=decoder_channels,
+        deeplab_backbone=str(ckpt_args.get("deeplab_backbone", "resnet50")),
+        unet_base=int(ckpt_args.get("unet_base", 64)),
+        yolo_seg_cfg=str(ckpt_args.get("yolo_seg_cfg", "yolo11m-seg.yaml")),
     ).to(device)
     student.load_state_dict(ckpt["student"], strict=True)
     student.eval()

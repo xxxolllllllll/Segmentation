@@ -45,7 +45,7 @@ from folds import fold_train_val_test, load_folds, to_tuples  # noqa: E402
 from models.dino_stage_a import DINOv3StageAModel  # noqa: E402
 from models.dino_stage_b_unet import DINOv3StageBUNet  # noqa: E402
 from models.teacher_vit import build_teacher  # noqa: E402
-from models.yolo_unet_semseg import YoloUNetSemanticStudent  # noqa: E402
+from models.student_factory import STUDENT_ARCHS, build_student  # noqa: E402
 from scripts.labelme_crack_copy_paste import (  # noqa: E402
     alpha_blend_paste,
     extract_instances,
@@ -861,6 +861,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--class-weights", type=str, default="", help="Optional CE class weights, e.g. 0.2,2.0")
     p.add_argument("--student-feat-channels", type=str, default="", help="Optional override C3,C4,C5")
     p.add_argument("--decoder-channels", type=str, default="256,192,128,64")
+    p.add_argument("--student-arch", type=str, default="yolo_unet", choices=STUDENT_ARCHS, help="Student segmentation architecture")
+    p.add_argument("--deeplab-backbone", type=str, default="resnet50", help="DeepLab backbone (resnet50/resnet101/mobilenet_v3_large)")
+    p.add_argument("--unet-base", type=int, default=64, help="UNet base channel width")
+    p.add_argument("--yolo-seg-cfg", type=str, default="yolo11m-seg.yaml", help="Ultralytics YAML for the from-scratch YOLO-seg student")
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument("--max-steps", type=int, default=0)
     p.add_argument("--max-val-batches", type=int, default=0)
@@ -1006,11 +1010,15 @@ def main() -> None:
 
     decoder_channels = parse_float_list(args.decoder_channels, 4, "--decoder-channels")
     assert decoder_channels is not None
-    student = YoloUNetSemanticStudent(
-        args.student_weights,
+    student = build_student(
+        args.student_arch,
         num_classes=args.num_classes,
         device=device,
+        student_weights=args.student_weights,
         decoder_channels=[int(x) for x in decoder_channels],
+        deeplab_backbone=args.deeplab_backbone,
+        unet_base=args.unet_base,
+        yolo_seg_cfg=args.yolo_seg_cfg,
     ).to(device)
     if args.student_feat_channels.strip():
         c3, c4, c5 = [int(x.strip()) for x in args.student_feat_channels.split(",")]
@@ -1222,7 +1230,8 @@ def main() -> None:
             "best_val": best_val,
             "args": vars(args),
             "neck_channels": (c3, c4, c5),
-            "model_type": "yolo_unet_semantic",
+            "model_type": f"student_{args.student_arch}",
+            "student_arch": args.student_arch,
             "valid_region": "component_mask & (mask != 255)",
         }
         torch.save(ckpt, args.output_dir / "last.pt")

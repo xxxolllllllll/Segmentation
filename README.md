@@ -41,6 +41,24 @@ paper_repro/
 - 教师特征来源（`dino_stage_a.py::extract_adapted_feature_maps`、
   `dino_stage_b_unet.py::extract_bridge_feature_maps`）。
 
+### 架构对比基线（单一变量：只换模型）
+
+与 S0（YOLO11-U-Net）对比的基线，**除学生架构外全部与 S0 相同**（同 CE+Dice 损失、AdamW 超参、
+100 epoch + val-IoU 早停、同 K-fold、同数据/增广/窗口/步长），且**全部 from scratch 初始化**：
+
+| ID | 学生架构 | 说明 |
+|----|----------|------|
+| S0 | `yolo_unet` | YOLO11m backbone/neck + U-Net 解码头（预训练 `yolo11m-seg.pt`） |
+| YOLOSeg | `yolo_seg` | 原生 YOLO11m-seg（backbone/neck/Segment head），从 `yolo11m-seg.yaml` 随机初始化，用 mask-prototype 聚合出语义裂缝 logits |
+| UNet | `unet` | 标准 U-Net（base=64），随机初始化 |
+| DeepLab | `deeplab` | torchvision DeepLabV3-ResNet50（`weights=None`），随机初始化 |
+
+- 由 `solution/models/student_factory.py::build_student` 统一构建；训练脚本用 `--student-arch` 选择，
+  评估脚本按 checkpoint 里的 `student_arch` 自动分发。
+- 通过 `EXPERIMENT_FILTER=YOLOSeg,UNet,DeepLab`（或与 S0 一起）运行，报告自动累加。
+- **DeepLab 需要 batch ≥ 2**（ASPP 全局池化含 BatchNorm；`KFOLD_BATCH_SIZE` 默认 2，满足）。
+- 依赖：`torchvision`（DeepLab）与 `ultralytics`（YOLOSeg/Unet），均已随环境安装。
+
 ## K 折协议
 
 - 在 `data/labelme/all` 上做 **K=5** 确定性划分（seed 42），清单缓存于 `runs/kfold/folds.json`，
