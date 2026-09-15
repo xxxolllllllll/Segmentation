@@ -122,23 +122,56 @@ def load_yolo_backbone_neck(weights: str | Path, device: torch.device) -> tuple[
     return model, channels
 
 
+def build_yolo_backbone_neck_from_cfg(cfg: str, device: torch.device) -> tuple[nn.Module, tuple[int, int, int]]:
+    """Build a YOLO-seg backbone/neck from a YAML config with random init (scratch).
+
+    Replaces the Segment head by FeatureTapHead, mirroring load_yolo_backbone_neck
+    but without loading any pretrained checkpoint.
+    """
+    from ultralytics.nn.modules.head import Segment
+    from ultralytics.nn.tasks import SegmentationModel
+
+    model = SegmentationModel(cfg=str(cfg), ch=3, nc=1, verbose=False)
+    head = model.model[-1]
+    if not isinstance(head, Segment):
+        raise TypeError(f"{cfg} must define a segmentation model with a Segment head")
+
+    channels = _segment_head_in_channels(head)
+    tap = FeatureTapHead()
+    _copy_ultralytics_graph_meta(head, tap)
+    model.model[-1] = tap
+    model.task = "segment"
+    model.to(device)
+    return model, channels
+
+
 class YoloUNetSemanticStudent(nn.Module):
     """YOLO11 backbone/neck with a U-Net semantic segmentation head.
 
     The full YOLO11 backbone/neck is unfrozen (fully trainable) together with the
     U-Net decoder, so feature/attention distillation on the neck outputs can shape
-    the student representation used by the decoder.
+    the student representation used by the decoder. If ``weights`` is None/empty the
+    YOLO backbone/neck is built from ``cfg`` with random init (from scratch);
+    otherwise it is initialized from the given checkpoint.
     """
 
     def __init__(
         self,
-        weights: str | Path,
-        num_classes: int,
-        device: torch.device,
+        weights: str | Path | None = None,
+        num_classes: int = 2,
+        device: torch.device | None = None,
         decoder_channels: Sequence[int] = (256, 192, 128, 64),
+        *,
+        cfg: str = "yolo11m-seg.yaml",
     ) -> None:
         super().__init__()
-        self.yolo, self.neck_channels = load_yolo_backbone_neck(weights, device=device)
+        use_scratch = weights is None or str(weights).strip() == ""
+        if use_scratch:
+            self.yolo, self.neck_channels = build_yolo_backbone_neck_from_cfg(cfg, device=device)
+            self.init = "scratch"
+        else:
+            self.yolo, self.neck_channels = load_yolo_backbone_neck(weights, device=device)
+            self.init = "pretrained"
         # Ultralytics load_checkpoint sets every parameter to requires_grad=False.
         # Unfreeze the whole YOLO backbone/neck so the student is trained end-to-end
         # (otherwise only the U-Net decoder would train and distillation on the neck

@@ -24,6 +24,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from PIL import Image, UnidentifiedImageError
 
+from checkpoint_io import torch_load_compat
 from dataset_seg import SegmentationPatchDataset, default_train_transforms, split_stems
 from folds import fold_train_val_test, load_folds, to_tuples
 from models.dino_stage_b_unet import DINOv3StageBUNet
@@ -195,6 +196,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fold", type=int, default=0, help="Held-out fold index (0-based) when --fold-split is set.")
     p.add_argument("--early-stop-patience", type=int, default=10, help="Early stop on val crack IoU patience.")
     p.add_argument("--val-stride", type=int, default=512, help="Sliding-window stride for image-level val IoU.")
+    p.add_argument("--resume", type=Path, default=None, help="Resume training from a Stage-B last.pt checkpoint.")
     p.add_argument("--train-adapters", action="store_true", help="Also train adapters in Stage B (default: frozen to preserve Stage A features).")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--adapter-bottleneck", type=int, default=64)
@@ -924,9 +926,43 @@ def main() -> None:
             args_dict[k] = v
     (args.output_dir / "config.json").write_text(json.dumps(args_dict, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    start_epoch = 1
     best_iou = -1.0
     patience_counter = 0
-    for epoch in range(1, args.epochs + 1):
+    if args.resume is not None:
+        resume_path = args.resume.expanduser().resolve()
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"--resume checkpoint not found: {resume_path}")
+        ckpt = torch_load_compat(resume_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model"], strict=True)
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scaler" in ckpt and isinstance(ckpt["scaler"], dict) and use_amp:
+            scaler.load_state_dict(ckpt["scaler"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        if "best_iou" in ckpt:
+            best_iou = float(ckpt["best_iou"])
+            patience_counter = int(ckpt.get("patience_counter", 0))
+        else:
+            # Backward-compat for older checkpoints (no best_iou/patience fields):
+            # recover from the sibling best.pt when available.
+            best_iou = float(ckpt.get("val_iou", -1.0))
+            patience_counter = 0
+            best_path = resume_path.parent / "best.pt"
+            if best_path.is_file():
+                try:
+                    bck = torch_load_compat(best_path, map_location="cpu", weights_only=False)
+                    best_iou = float(bck.get("val_iou", best_iou))
+                    patience_counter = max(0, int(ckpt.get("epoch", 0)) - int(bck.get("epoch", 0)))
+                except Exception:
+                    pass
+        print(
+            f"[resume] {resume_path} -> start_epoch={start_epoch} "
+            f"best_iou={best_iou:.6f} patience_counter={patience_counter}",
+            flush=True,
+        )
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         train_sum = 0.0
         n_train = 0
@@ -1014,22 +1050,28 @@ def main() -> None:
         train_avg = train_sum / max(1, n_train)
         print(f"[epoch {epoch:03d}/{args.epochs}] train={train_avg:.6f} val_iou={val_iou:.6f}")
 
+        improved = val_iou > best_iou
+        if improved:
+            best_iou = val_iou
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
         latest = {
             "epoch": epoch,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict() if use_amp else None,
             "train_loss": train_avg,
             "val_iou": val_iou,
+            "best_iou": best_iou,
+            "patience_counter": patience_counter,
             "args": vars(args),
         }
         torch.save(latest, args.output_dir / "last.pt")
-        if val_iou > best_iou:
-            best_iou = val_iou
-            patience_counter = 0
+        if improved:
             torch.save(latest, args.output_dir / "best.pt")
             print(f"[ckpt] best updated: val_iou={best_iou:.6f}")
-        else:
-            patience_counter += 1
         if epoch % args.save_every == 0:
             torch.save(latest, args.output_dir / f"epoch_{epoch:03d}.pt")
         if patience_counter >= args.early_stop_patience:

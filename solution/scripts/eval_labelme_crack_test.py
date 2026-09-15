@@ -273,6 +273,8 @@ def load_student(ckpt_path: Path, device: torch.device) -> tuple[torch.nn.Module
         deeplab_backbone=str(ckpt_args.get("deeplab_backbone", "resnet50")),
         unet_base=int(ckpt_args.get("unet_base", 64)),
         yolo_seg_cfg=str(ckpt_args.get("yolo_seg_cfg", "yolo11m-seg.yaml")),
+        yolo_unet_cfg=str(ckpt_args.get("yolo_unet_cfg", "yolo11m-seg.yaml")),
+        yolo_from_scratch=bool(ckpt_args.get("student_scratch", False)),
     ).to(device)
     student.load_state_dict(ckpt["student"], strict=True)
     student.eval()

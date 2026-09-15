@@ -865,6 +865,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--deeplab-backbone", type=str, default="resnet50", help="DeepLab backbone (resnet50/resnet101/mobilenet_v3_large)")
     p.add_argument("--unet-base", type=int, default=64, help="UNet base channel width")
     p.add_argument("--yolo-seg-cfg", type=str, default="yolo11m-seg.yaml", help="Ultralytics YAML for the from-scratch YOLO-seg student")
+    p.add_argument("--student-scratch", action="store_true", help="Build the YOLO11-Unet student from YAML (random init) instead of --student-weights")
+    p.add_argument("--yolo-unet-cfg", type=str, default="yolo11m-seg.yaml", help="Ultralytics YAML for the from-scratch YOLO11-Unet student backbone/neck")
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument("--max-steps", type=int, default=0)
     p.add_argument("--max-val-batches", type=int, default=0)
@@ -1019,6 +1021,8 @@ def main() -> None:
         deeplab_backbone=args.deeplab_backbone,
         unet_base=args.unet_base,
         yolo_seg_cfg=args.yolo_seg_cfg,
+        yolo_unet_cfg=args.yolo_unet_cfg,
+        yolo_from_scratch=args.student_scratch,
     ).to(device)
     if args.student_feat_channels.strip():
         c3, c4, c5 = [int(x.strip()) for x in args.student_feat_channels.split(",")]

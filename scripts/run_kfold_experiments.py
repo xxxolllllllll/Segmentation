@@ -89,17 +89,18 @@ class Experiment:
     lambda_feat: float
     lambda_attn: float
     student_arch: str = "yolo_unet"
+    student_scratch: bool = False
 
 
 EXPERIMENTS = [
-    Experiment("S0", "raw_vit", 0.0, 0.0),
-    Experiment("S1", "raw_vit", 0.5, 0.0),
-    Experiment("S1_attn", "raw_vit", 0.5, 0.2),
-    Experiment("S2", "stage_a", 0.5, 0.0),
-    Experiment("S2_attn", "stage_a", 0.5, 0.2),
-    Experiment("S3", "stage_b", 0.5, 0.0),
-    Experiment("S3_attn", "stage_b", 0.5, 0.2),
-    # Architecture-comparison baselines (no distillation; same protocol as S0).
+    Experiment("S0", "raw_vit", 0.0, 0.0, student_scratch=True),
+    Experiment("S1", "raw_vit", 0.5, 0.0, student_scratch=True),
+    Experiment("S1_attn", "raw_vit", 0.5, 0.2, student_scratch=True),
+    Experiment("S2", "stage_a", 0.5, 0.0, student_scratch=True),
+    Experiment("S2_attn", "stage_a", 0.5, 0.2, student_scratch=True),
+    Experiment("S3", "stage_b", 0.5, 0.0, student_scratch=True),
+    Experiment("S3_attn", "stage_b", 0.5, 0.2, student_scratch=True),
+    # Architecture-comparison baselines (no distillation; same protocol as S0, from scratch).
     Experiment("YOLOSeg", "raw_vit", 0.0, 0.0, student_arch="yolo_seg"),
     Experiment("UNet", "raw_vit", 0.0, 0.0, student_arch="unet"),
     Experiment("DeepLab", "raw_vit", 0.0, 0.0, student_arch="deeplab"),
@@ -254,6 +255,7 @@ def run_stage_c(fold: int, exp: Experiment, stage_b_ckpt: Path | None) -> Path:
         "--images-dir", str(LABELME_ALL_DIR),
         "--student-weights", str(YOLO_WEIGHTS),
         "--student-arch", exp.student_arch,
+        *(["--student-scratch"] if exp.student_scratch else []),
         "--teacher-mode", exp.teacher_mode,
         "--output-dir", str(out),
         "--num-classes", "2",
