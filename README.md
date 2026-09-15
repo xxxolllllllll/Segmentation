@@ -48,7 +48,7 @@ paper_repro/
 
 | ID | 学生架构 | 说明 |
 |----|----------|------|
-| S0 | `yolo_unet` | YOLO11m backbone/neck + U-Net 解码头（预训练 `yolo11m-seg.pt`） |
+| S0 | `yolo_unet` | YOLO11m backbone/neck + U-Net 解码头（预训练 `yolo11m-seg.pt`，**backbone/neck 全解冻、端到端训练，22.35M 可训练**） |
 | YOLOSeg | `yolo_seg` | 原生 YOLO11m-seg（backbone/neck/Segment head），从 `yolo11m-seg.yaml` 随机初始化，用 mask-prototype 聚合出语义裂缝 logits |
 | UNet | `unet` | 标准 U-Net（base=64），随机初始化 |
 | DeepLab | `deeplab` | torchvision DeepLabV3-ResNet50（`weights=None`），随机初始化 |
@@ -58,6 +58,9 @@ paper_repro/
 - 通过 `EXPERIMENT_FILTER=YOLOSeg,UNet,DeepLab`（或与 S0 一起）运行，报告自动累加。
 - **DeepLab 需要 batch ≥ 2**（ASPP 全局池化含 BatchNorm；`KFOLD_BATCH_SIZE` 默认 2，满足）。
 - 依赖：`torchvision`（DeepLab）与 `ultralytics`（YOLOSeg/Unet），均已随环境安装。
+- **注意（S0 学生）**：`YoloUNetSemanticStudent` 的 YOLO11m backbone/neck 为**全解冻**（Ultralytics
+  `load_checkpoint` 默认冻结，已在 `yolo_unet_semseg.py` 中显式解冻）。因此 S0 与学生蒸馏实验
+  （S1/S1_attn/S2/S2_attn/S3/S3_attn）在改动后需要重跑，旧结果（仅训 3.71M 解码器）作废。
 
 ## K 折协议
 

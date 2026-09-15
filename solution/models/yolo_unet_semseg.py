@@ -123,7 +123,12 @@ def load_yolo_backbone_neck(weights: str | Path, device: torch.device) -> tuple[
 
 
 class YoloUNetSemanticStudent(nn.Module):
-    """YOLO11 backbone/neck with a U-Net semantic segmentation head."""
+    """YOLO11 backbone/neck with a U-Net semantic segmentation head.
+
+    The full YOLO11 backbone/neck is unfrozen (fully trainable) together with the
+    U-Net decoder, so feature/attention distillation on the neck outputs can shape
+    the student representation used by the decoder.
+    """
 
     def __init__(
         self,
@@ -134,6 +139,12 @@ class YoloUNetSemanticStudent(nn.Module):
     ) -> None:
         super().__init__()
         self.yolo, self.neck_channels = load_yolo_backbone_neck(weights, device=device)
+        # Ultralytics load_checkpoint sets every parameter to requires_grad=False.
+        # Unfreeze the whole YOLO backbone/neck so the student is trained end-to-end
+        # (otherwise only the U-Net decoder would train and distillation on the neck
+        # features could not shape the student representation at all).
+        for p in self.yolo.parameters():
+            p.requires_grad_(True)
         self.decoder = YoloUNetDecoder(self.neck_channels, num_classes=num_classes, decoder_channels=decoder_channels)
         self.num_classes = int(num_classes)
         self.last_feats: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
