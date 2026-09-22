@@ -1,5 +1,6 @@
 weights/*
 runs/*
+runs*
 data/*
 '面向少样本古建筑木构件裂缝分割的跨架构视觉大模型知识蒸馏方法(1).pdf'
 !weights/.gitkeep

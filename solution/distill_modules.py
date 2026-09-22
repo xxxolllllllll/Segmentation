@@ -68,6 +68,66 @@ class StudentChannelAlign(nn.Module):
         return self.proj[0](p3), self.proj[1](p4), self.proj[2](p5)
 
 
+class TeacherAlignHead(nn.Module):
+    """教师侧逐层投影到共享隐空间 ``D``。
+
+    用于把异构教师（raw/adapted ViT 的 concat 特征，或 Stage-B bridge 特征）
+    统一到同一蒸馏空间。每层一个 1x1 卷积；可选输入归一化用于稳定那些原始幅值
+    差异巨大的层（如浅层 vs 深层残差流）。
+    """
+
+    def __init__(
+        self,
+        in_channels: int | Sequence[int],
+        out_channels: int | Sequence[int] = 256,
+        pre_norm: str = "none",
+    ):
+        super().__init__()
+        if isinstance(in_channels, int):
+            in_channels = (in_channels, in_channels, in_channels)
+        in_channels = tuple(int(c) for c in in_channels)
+        if isinstance(out_channels, int):
+            out_channels = (out_channels, out_channels, out_channels)
+        out_channels = tuple(int(c) for c in out_channels)
+        if len(in_channels) != 3 or len(out_channels) != 3:
+            raise ValueError("in/out channels must be an int or a 3-tuple")
+        if pre_norm not in ("none", "inst"):
+            raise ValueError(f"unknown pre_norm: {pre_norm}")
+        blocks = []
+        for ic, oc in zip(in_channels, out_channels):
+            layers: list[nn.Module] = []
+            if pre_norm == "inst":
+                layers.append(nn.InstanceNorm2d(ic, affine=False))
+            layers.append(nn.Conv2d(ic, oc, kernel_size=1))
+            blocks.append(nn.Sequential(*layers))
+        self.out_channels = out_channels
+        self.proj = nn.ModuleList(blocks)
+
+    def forward(self, feats: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if len(feats) != 3:
+            raise ValueError("TeacherAlignHead expects 3 feature levels")
+        return self.proj[0](feats[0]), self.proj[1](feats[1]), self.proj[2](feats[2])
+
+
+def standardize_feature(x: torch.Tensor, mode: str = "inst", eps: float = 1e-5) -> torch.Tensor:
+    """在蒸馏损失前对 [N,C,H,W] 特征图做归一化。
+
+    - ``inst``：逐通道（在 H,W 上）减均值除标准差，去掉残差流幅值膨胀与逐通道 DC 偏置；
+    - ``ln``：在每个空间位置上跨通道归一化，去掉通道间公共偏移/尺度；
+    - ``inst+ln``：两者都做。
+    """
+    if mode in ("none", ""):
+        return x
+    if mode in ("inst", "inst+ln"):
+        mu = x.mean(dim=(2, 3), keepdim=True)
+        sd = x.std(dim=(2, 3), keepdim=True, unbiased=False)
+        x = (x - mu) / (sd + eps)
+    if mode in ("ln", "inst+ln"):
+        c = x.shape[1]
+        x = F.layer_norm(x.permute(0, 2, 3, 1), (c,)).permute(0, 3, 1, 2)
+    return x
+
+
 class AdaptiveTeacherFusion(nn.Module):
     """
     教师相邻编码层特征的自适应加权融合模块。

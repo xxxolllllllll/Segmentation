@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import csv
 import io
 import json
 import random
@@ -43,6 +44,22 @@ from val_eval import (
     compute_crack_metrics,
     predict_teacher_mask,
 )
+
+
+EPOCH_METRICS_FIELDS = ["epoch", "train_loss", "val_iou", "best_iou", "patience_counter"]
+
+
+def prepare_epoch_metrics_csv(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return
+    with path.open("w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(EPOCH_METRICS_FIELDS)
+
+
+def append_epoch_metrics_csv(path: Path, row: dict) -> None:
+    with path.open("a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([row.get(k, "") for k in EPOCH_METRICS_FIELDS])
 
 
 def set_seed(seed: int) -> None:
@@ -961,8 +978,24 @@ def main() -> None:
             f"best_iou={best_iou:.6f} patience_counter={patience_counter}",
             flush=True,
         )
+        if start_epoch > args.epochs or patience_counter >= args.early_stop_patience:
+            reason = (
+                f"start_epoch={start_epoch} > epochs={args.epochs}"
+                if start_epoch > args.epochs
+                else f"patience_counter={patience_counter} >= {args.early_stop_patience}"
+            )
+            print(f"[resume] already finished/early-stopped ({reason}); nothing to train.", flush=True)
+            (args.output_dir / ".completed").write_text(
+                json.dumps({"last_epoch": int(ckpt.get("epoch", 0)), "target_epochs": args.epochs}),
+                encoding="utf-8",
+            )
+            return
 
+    epoch_metrics_csv = args.output_dir / "epoch_metrics.csv"
+    prepare_epoch_metrics_csv(epoch_metrics_csv)
+    last_epoch = start_epoch - 1
     for epoch in range(start_epoch, args.epochs + 1):
+        last_epoch = epoch
         model.train()
         train_sum = 0.0
         n_train = 0
@@ -1057,6 +1090,17 @@ def main() -> None:
         else:
             patience_counter += 1
 
+        append_epoch_metrics_csv(
+            epoch_metrics_csv,
+            {
+                "epoch": epoch,
+                "train_loss": train_avg,
+                "val_iou": val_iou,
+                "best_iou": best_iou,
+                "patience_counter": patience_counter,
+            },
+        )
+
         latest = {
             "epoch": epoch,
             "model": model.state_dict(),
@@ -1077,6 +1121,11 @@ def main() -> None:
         if patience_counter >= args.early_stop_patience:
             print(f"[early-stop] no improvement for {args.early_stop_patience} epochs, stopping at epoch {epoch}")
             break
+
+    (args.output_dir / ".completed").write_text(
+        json.dumps({"last_epoch": last_epoch, "target_epochs": args.epochs}, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

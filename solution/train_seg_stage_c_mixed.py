@@ -40,6 +40,8 @@ from distill_modules import (  # noqa: E402
     BridgeTeacherTargets,
     ConcatTeacherTargets,
     StudentChannelAlign,
+    TeacherAlignHead,
+    standardize_feature,
 )
 from folds import fold_train_val_test, load_folds, to_tuples  # noqa: E402
 from models.dino_stage_a import DINOv3StageAModel  # noqa: E402
@@ -522,6 +524,111 @@ def collate_curated(batch: list[dict]) -> dict:
     }
 
 
+class SoftLabelWindowDataset(Dataset):
+    """Unlabeled windows paired with offline Stage-B crack-logit maps (Phase 3)."""
+
+    def __init__(
+        self,
+        label_dir: Path,
+        image_roots: Sequence[Path],
+        *,
+        imgsz: int,
+        window_size: int,
+        two_channel: bool,
+    ):
+        self.label_dir = Path(label_dir)
+        self.image_roots = [Path(r).expanduser().resolve() for r in image_roots]
+        self.imgsz = int(imgsz)
+        self.window_size = int(window_size)
+        self.two_channel = bool(two_channel)
+        manifest = self.label_dir / "manifest.jsonl"
+        if not manifest.is_file():
+            raise FileNotFoundError(f"missing soft-label manifest: {manifest}")
+        self.entries: list[tuple[Path, int, int, Path]] = []
+        with manifest.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                img = self._resolve_image(rec["rel"])
+                if img is None:
+                    continue
+                self.entries.append((img, int(rec["y"]), int(rec["x"]), self.label_dir / rec["npy"]))
+        if not self.entries:
+            raise RuntimeError(f"no usable soft-label entries in {manifest}")
+
+    def _resolve_image(self, rel: str) -> Optional[Path]:
+        for root in self.image_roots:
+            p = root / rel
+            if p.is_file():
+                return p
+        return None
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, idx: int) -> dict:
+        img_path, y0, x0, npy_path = self.entries[idx]
+        with Image.open(img_path) as im:
+            image_np = np.array(im.convert("RGB"), dtype=np.uint8)
+        win = crop_top_left_rgb(image_np, y0, x0, self.window_size, self.window_size)
+        pil = Image.fromarray(win)
+        if self.imgsz > 0 and pil.size != (self.imgsz, self.imgsz):
+            pil = pil.resize((self.imgsz, self.imgsz), Image.BILINEAR)
+        img_np = np.array(pil, dtype=np.float32) / 255.0
+        soft = torch.from_numpy(np.load(npy_path).astype(np.float32))
+        if soft.dim() == 2:
+            soft = soft.unsqueeze(0)
+        if soft.shape[-1] != self.imgsz or soft.shape[-2] != self.imgsz:
+            soft = F.interpolate(
+                soft.unsqueeze(0), size=(self.imgsz, self.imgsz), mode="bilinear", align_corners=False
+            ).squeeze(0)
+        return {
+            "img": torch.from_numpy(np.transpose(img_np, (2, 0, 1))),
+            "soft_logit": soft,
+            "stem": f"{img_path.stem}_y{y0}_x{x0}",
+        }
+
+
+def collate_soft(batch: list[dict]) -> dict:
+    return {
+        "img": torch.stack([b["img"] for b in batch], dim=0),
+        "soft_logit": torch.stack([b["soft_logit"] for b in batch], dim=0),
+        "stem": [b["stem"] for b in batch],
+    }
+
+
+def soft_label_kd_loss(
+    student_logits: torch.Tensor,
+    soft_logit: torch.Tensor,
+    *,
+    temp: float,
+    conf_thresh: float,
+) -> torch.Tensor:
+    """Temperature-scaled KD against cached teacher crack logits, masked by confidence."""
+    logits = student_logits.float()
+    tgt_logit = soft_logit.float()
+    if tgt_logit.dim() == 4 and tgt_logit.shape[1] == 1:
+        p = torch.sigmoid(tgt_logit[:, 0])
+    else:
+        p = torch.softmax(tgt_logit, dim=1)[:, 1]
+    conf = torch.maximum(p, 1.0 - p)
+    mask = (conf > conf_thresh).float()
+    if float(mask.sum()) < 1.0:
+        return logits.sum() * 0.0
+    if tgt_logit.dim() == 4 and tgt_logit.shape[1] == 1:
+        target = torch.sigmoid(tgt_logit[:, 0] / temp)
+        d = (logits[:, 1] - logits[:, 0]) / temp
+        loss = F.binary_cross_entropy_with_logits(d, target, reduction="none") * (temp * temp)
+    else:
+        target = torch.softmax(tgt_logit / temp, dim=1)
+        logp = F.log_softmax(logits / temp, dim=1)
+        loss = -(target * logp).sum(dim=1) * (temp * temp)
+    loss = loss * mask
+    return loss.sum() / (mask.sum() + 1e-6)
+
+
 def build_weighted_sampler_weights(is_positive_mask: list[bool], positive_ratio: float) -> Optional[list[float]]:
     if not (0.0 < positive_ratio < 1.0) or not is_positive_mask:
         return None
@@ -622,6 +729,38 @@ def append_epoch_metrics_csv(path: Path, row: dict[str, float | int]) -> None:
     with path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=EPOCH_METRICS_FIELDS)
         writer.writerow({k: row.get(k, "") for k in EPOCH_METRICS_FIELDS})
+
+
+def recover_patience_from_metrics(csv_path: Path, last_epoch: int) -> tuple[int, int]:
+    """Recover (patience_counter, best_epoch) from an epoch_metrics.csv.
+
+    In the CSV ``best_val`` is the running maximum of the validation IoU, so the
+    last epoch at which it increased is the best epoch; the early-stop counter is
+    then ``last_epoch - best_epoch``. Used as a backward-compat fallback when
+    resuming checkpoints written before ``patience_counter``/``best_epoch`` were
+    saved.
+    """
+    if last_epoch <= 0 or not csv_path.is_file():
+        return 0, 0
+    try:
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return 0, 0
+    best_epoch = 0
+    prev_best: float | None = None
+    for row in rows:
+        try:
+            ep = int(float(str(row.get("epoch", "")).strip()))
+            bv = float(str(row.get("best_val", "")).strip())
+        except Exception:
+            continue
+        if prev_best is None or bv > prev_best:
+            prev_best = bv
+            best_epoch = ep
+    if best_epoch <= 0:
+        return 0, 0
+    return max(0, last_epoch - best_epoch), best_epoch
 
 
 def load_stage_b_teacher(args: argparse.Namespace, device: torch.device) -> DINOv3StageBUNet:
@@ -748,6 +887,19 @@ def spatial_attention(feat: torch.Tensor, valid: torch.Tensor, eps: float = 1e-6
     return att / denom
 
 
+def _feature_scale_stats(feat: torch.Tensor) -> dict[str, float]:
+    """Magnitude / channel-statistics of a [N, C, H, W] feature map (for distillation diagnostics)."""
+    f = feat.detach().float()
+    cmean = f.mean(dim=(0, 2, 3))
+    cstd = f.std(dim=(0, 2, 3), unbiased=False)
+    return {
+        "absmean": float(f.abs().mean()),
+        "mean": float(cmean.mean()),
+        "cmean_std": float(cmean.std(unbiased=False)),
+        "cstd_mean": float(cstd.mean()),
+    }
+
+
 def compute_distill_losses(
     *,
     images_01: torch.Tensor,
@@ -756,11 +908,14 @@ def compute_distill_losses(
     student_feats: Sequence[torch.Tensor],
     teacher: nn.Module,
     align: StudentChannelAlign,
+    teacher_align: nn.Module,
     targets_fn: nn.Module,
     teacher_mode: str,
     teacher_img_size: int,
     lambdas: Sequence[float],
     attn_gamma: float,
+    feat_norm: str = "none",
+    stats_out: dict[int, dict[str, object]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     s_feats = align(student_feats[0], student_feats[1], student_feats[2])
     target_sizes = [(s.shape[2], s.shape[3]) for s in s_feats]
@@ -769,6 +924,10 @@ def compute_distill_losses(
     with torch.no_grad():
         t_feats = extract_teacher_feature_maps(teacher, x_t, teacher_mode)
     t_targets = targets_fn(t_feats, target_sizes)
+    t_targets = teacher_align(t_targets)  # unify teachers into the shared D space
+    if feat_norm not in ("none", ""):
+        s_feats = [standardize_feature(s, feat_norm) for s in s_feats]
+        t_targets = [standardize_feature(t, feat_norm) for t in t_targets]
 
     feat_total = torch.zeros((), device=images_01.device, dtype=s_feats[0].dtype)
     attn_total = torch.zeros_like(feat_total)
@@ -780,16 +939,75 @@ def compute_distill_losses(
         v_l = resize_mask(valid, s_l.shape[-2:]) > 0.5
         if not bool(v_l.any()):
             continue
-        feat_total = feat_total + alpha * masked_smooth_l1(s_l, t_l, v_l)
+        feat_raw = masked_smooth_l1(s_l, t_l, v_l)
+        feat_total = feat_total + alpha * feat_raw
 
         m_l = resize_mask(crack, s_l.shape[-2:]) > 0.5
         a_s = spatial_attention(s_l, v_l)
         a_t = spatial_attention(t_l.detach(), v_l)
         weight = v_l[:, None].to(dtype=a_s.dtype, device=a_s.device) * (1.0 + float(attn_gamma) * m_l[:, None].to(dtype=a_s.dtype, device=a_s.device))
         denom = weight.sum()
+        attn_raw = torch.zeros((), device=images_01.device, dtype=feat_total.dtype)
         if float(denom.detach().cpu()) > 0.0:
-            attn_total = attn_total + alpha * (weight * (a_s - a_t).pow(2)).sum() / (denom + 1e-6)
+            attn_raw = (weight * (a_s - a_t).pow(2)).sum() / (denom + 1e-6)
+            attn_total = attn_total + alpha * attn_raw
+
+        if stats_out is not None:
+            stats_out[i] = {
+                "alpha": alpha,
+                "feat_raw": float(feat_raw.detach().float()),
+                "feat_weighted": float((alpha * feat_raw).detach().float()),
+                "attn_raw": float(attn_raw.detach().float()),
+                "attn_weighted": float((alpha * attn_raw).detach().float()),
+                "valid_frac": float(v_l.float().mean()),
+                "student": _feature_scale_stats(s_l),
+                "teacher": _feature_scale_stats(t_l),
+            }
     return feat_total, attn_total
+
+
+def _print_distill_diag(
+    *,
+    step: int,
+    ce: float,
+    dice: float,
+    feat: float,
+    attn: float,
+    stats: dict[int, dict[str, object]],
+    lambda_feat: float,
+    lambda_attn: float,
+) -> None:
+    base = ce + dice
+    feat_w = lambda_feat * feat
+    attn_w = lambda_attn * attn
+    print(
+        f"[distill-diag] step={step} ce={ce:.4f} dice={dice:.4f} base(ce+dice)={base:.4f} | "
+        f"feat_sum={feat:.6f} (weighted x{lambda_feat:g}={feat_w:.6f}) "
+        f"attn_sum={attn:.6f} (weighted x{lambda_attn:g}={attn_w:.6f}) | "
+        f"ratio feat/base={feat_w / (base + 1e-12):.4f} attn/base={attn_w / (base + 1e-12):.4f}",
+        flush=True,
+    )
+    level_names = {0: "P3", 1: "P4", 2: "P5"}
+    for i in sorted(stats):
+        s = stats[i]
+        alpha = float(s["alpha"])
+        ss = s["student"]
+        ts = s["teacher"]
+        print(
+            f"    {level_names.get(i, f'L{i}')}: alpha={alpha:g} valid={float(s['valid_frac']):.3f} "
+            f"feat_raw={float(s['feat_raw']):.6f} feat_eff_w={lambda_feat * alpha:g} "
+            f"(contrib={float(s['feat_weighted']) * lambda_feat:.6f}) | "
+            f"attn_raw={float(s['attn_raw']):.6f} attn_eff_w={lambda_attn * alpha:g} "
+            f"(contrib={float(s['attn_weighted']) * lambda_attn:.6f})",
+            flush=True,
+        )
+        print(
+            f"        student absmean={ss['absmean']:.4f} mean={ss['mean']:.4f} "
+            f"cmean_std={ss['cmean_std']:.4f} cstd_mean={ss['cstd_mean']:.4f} | "
+            f"teacher absmean={ts['absmean']:.4f} mean={ts['mean']:.4f} "
+            f"cmean_std={ts['cmean_std']:.4f} cstd_mean={ts['cstd_mean']:.4f}",
+            flush=True,
+        )
 
 
 def needs_teacher_distill(args: argparse.Namespace) -> bool:
@@ -810,6 +1028,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-classes", type=int, default=2)
     p.add_argument("--imgsz", type=int, default=1024)
     p.add_argument("--teacher-img-size", type=int, default=1024)
+    p.add_argument("--align-dim", type=int, default=256, help="Shared teacher/student distillation channel dim D")
+    p.add_argument(
+        "--feat-norm",
+        type=str,
+        default="inst",
+        choices=("none", "inst", "ln", "inst+ln"),
+        help="Normalization applied to teacher/student feature maps before SmoothL1",
+    )
+    p.add_argument(
+        "--align-pre-norm",
+        type=str,
+        default="none",
+        choices=("none", "inst"),
+        help="Optional normalization inside the teacher align head (stabilises raw magnitudes)",
+    )
+    p.add_argument("--soft-label-dir", type=Path, default=None, help="Offline soft-label cache root (with manifest.jsonl)")
+    p.add_argument("--soft-image-roots", type=Path, nargs="+", default=None, help="Unlabeled image roots matching the soft labels")
+    p.add_argument("--lambda-soft", type=float, default=0.0, help="Weight of the soft-label KD term (0 disables)")
+    p.add_argument("--soft-temp", type=float, default=2.0)
+    p.add_argument("--soft-conf-thresh", type=float, default=0.7, help="Only distill pixels with teacher confidence above this")
+    p.add_argument("--soft-batch-size", type=int, default=0, help="0 = same as --batch-size-curated")
+    p.add_argument("--soft-num-workers", type=int, default=0)
     p.add_argument("--window-size", type=int, default=0, help="0 = use --imgsz")
     p.add_argument("--window-stride", type=int, default=800)
     p.add_argument("--keep-outside-component-patches", action="store_true")
@@ -858,6 +1098,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda-l1", type=float, default=0.5)
     p.add_argument("--lambda-l2", type=float, default=0.3)
     p.add_argument("--lambda-l3", type=float, default=0.2)
+    p.add_argument(
+        "--debug-distill-steps",
+        type=int,
+        default=0,
+        help="If >0, print per-level feat/attn loss magnitudes for the first N train steps (diagnostic only)",
+    )
     p.add_argument("--class-weights", type=str, default="", help="Optional CE class weights, e.g. 0.2,2.0")
     p.add_argument("--student-feat-channels", type=str, default="", help="Optional override C3,C4,C5")
     p.add_argument("--decoder-channels", type=str, default="256,192,128,64")
@@ -1010,6 +1256,33 @@ def main() -> None:
     if len(train_loader) == 0:
         raise RuntimeError("Train loader empty; lower --batch-size-curated")
 
+    soft_loader = None
+    if float(args.lambda_soft) > 0.0:
+        if args.soft_label_dir is None or not args.soft_image_roots:
+            raise ValueError("--lambda-soft > 0 requires --soft-label-dir and --soft-image-roots")
+        soft_meta_path = Path(args.soft_label_dir) / "meta.json"
+        two_channel = True
+        if soft_meta_path.is_file():
+            two_channel = json.loads(soft_meta_path.read_text(encoding="utf-8")).get("save_logits", "both") == "both"
+        soft_ds = SoftLabelWindowDataset(
+            Path(args.soft_label_dir),
+            args.soft_image_roots,
+            imgsz=args.imgsz,
+            window_size=window_size,
+            two_channel=two_channel,
+        )
+        soft_bs = int(args.soft_batch_size) if int(args.soft_batch_size) > 0 else int(args.batch_size_curated)
+        soft_loader = DataLoader(
+            soft_ds,
+            batch_size=soft_bs,
+            shuffle=True,
+            num_workers=int(args.soft_num_workers),
+            pin_memory=device.type == "cuda",
+            collate_fn=collate_soft,
+            drop_last=True,
+        )
+        print(f"[soft] enabled: {len(soft_ds)} windows, batch={soft_bs}, temp={args.soft_temp}, conf>{args.soft_conf_thresh}", flush=True)
+
     decoder_channels = parse_float_list(args.decoder_channels, 4, "--decoder-channels")
     assert decoder_channels is not None
     student = build_student(
@@ -1031,18 +1304,28 @@ def main() -> None:
 
     teacher: nn.Module | None = None
     align: StudentChannelAlign | None = None
+    teacher_align: TeacherAlignHead | None = None
     targets_fn: nn.Module | None = None
     teacher_dim: int | None = None
     if use_teacher:
         teacher = load_teacher(args, device=device)
         teacher_dim = teacher_feature_dim(teacher)
         if args.teacher_mode == "stage_b":
-            align_out = (128, 192, 256)
+            teacher_target_channels = (128, 192, 256)
             targets_fn = BridgeTeacherTargets().to(device)
         else:
-            align_out = (2 * teacher_dim, 2 * teacher_dim, 2 * teacher_dim)
+            teacher_target_channels = (2 * teacher_dim, 2 * teacher_dim, 2 * teacher_dim)
             targets_fn = ConcatTeacherTargets().to(device)
-        align = StudentChannelAlign(in_channels=(c3, c4, c5), out_channels=align_out).to(device)
+        if args.debug_distill_steps > 0:
+            # Keep align/targets init identical across teacher-mode diagnostics.
+            set_seed(args.seed)
+        align_dim = int(args.align_dim)
+        align = StudentChannelAlign(in_channels=(c3, c4, c5), out_channels=(align_dim, align_dim, align_dim)).to(device)
+        teacher_align = TeacherAlignHead(
+            in_channels=teacher_target_channels,
+            out_channels=align_dim,
+            pre_norm=args.align_pre_norm,
+        ).to(device)
 
     class_weights = parse_float_list(args.class_weights, args.num_classes, "--class-weights")
     ce_weight = torch.tensor(class_weights, device=device, dtype=torch.float32) if class_weights else None
@@ -1052,6 +1335,8 @@ def main() -> None:
     params = list(student.parameters())
     if align is not None:
         params += list(align.parameters())
+    if teacher_align is not None:
+        params += list(teacher_align.parameters())
     if targets_fn is not None:
         params += list(targets_fn.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
@@ -1060,6 +1345,7 @@ def main() -> None:
 
     start_epoch = 1
     best_val = -1.0
+    best_epoch = 0
     patience_counter = 0
     if args.resume is not None:
         resume_path = args.resume.expanduser().resolve()
@@ -1067,13 +1353,31 @@ def main() -> None:
         student.load_state_dict(ckpt["student"], strict=True)
         if align is not None and "align" in ckpt:
             align.load_state_dict(ckpt["align"], strict=True)
+        if teacher_align is not None and ckpt.get("teacher_align") is not None:
+            teacher_align.load_state_dict(ckpt["teacher_align"], strict=True)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scaler" in ckpt and isinstance(ckpt["scaler"], dict):
             scaler.load_state_dict(ckpt["scaler"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_val = float(ckpt.get("best_val", best_val))
-        print(f"[resume] {resume_path} -> start_epoch={start_epoch} best_val={best_val:.4f}", flush=True)
+        if "patience_counter" in ckpt and "best_epoch" in ckpt:
+            patience_counter = int(ckpt["patience_counter"])
+            best_epoch = int(ckpt["best_epoch"])
+        else:
+            patience_counter, best_epoch = recover_patience_from_metrics(
+                resume_path.parent / "epoch_metrics.csv", int(ckpt.get("epoch", 0))
+            )
+            print(
+                f"[resume] legacy checkpoint without patience fields; "
+                f"recovered best_epoch={best_epoch} patience_counter={patience_counter}",
+                flush=True,
+            )
+        print(
+            f"[resume] {resume_path} -> start_epoch={start_epoch} best_val={best_val:.4f} "
+            f"best_epoch={best_epoch} patience_counter={patience_counter}",
+            flush=True,
+        )
 
     config = {
         **vars(args),
@@ -1102,16 +1406,22 @@ def main() -> None:
         flush=True,
     )
 
+    last_epoch = start_epoch - 1
+    if args.debug_distill_steps > 0:
+        # Reproducible data order / augmentation for cross-teacher diagnostics.
+        set_seed(args.seed)
     for epoch in range(start_epoch, args.epochs + 1):
+        last_epoch = epoch
         student.train()
         if align is not None:
             align.train()
         if targets_fn is not None:
             targets_fn.train()
-        running = {"ce": 0.0, "dice": 0.0, "feat": 0.0, "attn": 0.0, "total": 0.0}
+        running = {"ce": 0.0, "dice": 0.0, "feat": 0.0, "attn": 0.0, "soft": 0.0, "total": 0.0}
         n_batches = 0
         n_train = len(train_loader) if args.max_steps <= 0 else min(len(train_loader), args.max_steps)
         print(f"\n======== Epoch {epoch}/{args.epochs} ({n_train} batches) ========", flush=True)
+        soft_iter = iter(soft_loader) if soft_loader is not None else None
 
         for bi, batch in enumerate(train_loader, start=1):
             if args.max_steps > 0 and bi > args.max_steps:
@@ -1127,8 +1437,12 @@ def main() -> None:
                 dice = dice_loss_fn(logits, mask)
                 feat = torch.zeros((), device=device, dtype=logits.dtype)
                 attn = torch.zeros((), device=device, dtype=logits.dtype)
+                soft_loss = torch.zeros((), device=device, dtype=logits.dtype)
+                distill_stats: dict[int, dict[str, object]] | None = None
+                if use_teacher and args.debug_distill_steps > 0 and bi <= args.debug_distill_steps:
+                    distill_stats = {}
                 if use_teacher:
-                    assert teacher is not None and align is not None and targets_fn is not None
+                    assert teacher is not None and align is not None and teacher_align is not None and targets_fn is not None
                     feat, attn = compute_distill_losses(
                         images_01=img,
                         mask=mask,
@@ -1136,17 +1450,46 @@ def main() -> None:
                         student_feats=feats,
                         teacher=teacher,
                         align=align,
+                        teacher_align=teacher_align,
                         targets_fn=targets_fn,
                         teacher_mode=args.teacher_mode,
                         teacher_img_size=args.teacher_img_size,
                         lambdas=lambdas,
                         attn_gamma=args.attn_crack_gamma,
+                        feat_norm=args.feat_norm,
+                        stats_out=distill_stats,
                     )
+                if soft_loader is not None:
+                    try:
+                        soft_batch = next(soft_iter)  # type: ignore[arg-type]
+                    except StopIteration:
+                        soft_iter = iter(soft_loader)
+                        soft_batch = next(soft_iter)
+                    soft_img = soft_batch["img"].to(device, non_blocking=True)
+                    soft_tgt = soft_batch["soft_logit"].to(device, non_blocking=True)
+                    soft_logits, _ = student(soft_img)
+                    soft_loss = soft_label_kd_loss(
+                        soft_logits, soft_tgt, temp=args.soft_temp, conf_thresh=args.soft_conf_thresh
+                    )
+
                 total = (
                     args.lambda_ce * ce
                     + args.lambda_dice * dice
                     + args.lambda_feat_curated * feat
                     + args.lambda_attn_curated * attn
+                    + args.lambda_soft * soft_loss
+                )
+
+            if distill_stats is not None:
+                _print_distill_diag(
+                    step=bi,
+                    ce=float(ce.detach()),
+                    dice=float(dice.detach()),
+                    feat=float(feat.detach()),
+                    attn=float(attn.detach()),
+                    stats=distill_stats,
+                    lambda_feat=args.lambda_feat_curated,
+                    lambda_attn=args.lambda_attn_curated,
                 )
 
             scaler.scale(total).backward()
@@ -1157,6 +1500,7 @@ def main() -> None:
             running["dice"] += float(dice.detach())
             running["feat"] += float(feat.detach())
             running["attn"] += float(attn.detach())
+            running["soft"] += float(soft_loss.detach())
             running["total"] += float(total.detach())
             n_batches += 1
 
@@ -1164,7 +1508,8 @@ def main() -> None:
                 print(
                     f"  batch {bi}/{n_train} total={running['total']/n_batches:.4f} "
                     f"ce={running['ce']/n_batches:.4f} dice={running['dice']/n_batches:.4f} "
-                    f"feat={running['feat']/n_batches:.4f} attn={running['attn']/n_batches:.4f}",
+                    f"feat={running['feat']/n_batches:.4f} attn={running['attn']/n_batches:.4f} "
+                    f"soft={running['soft']/n_batches:.4f}",
                     flush=True,
                 )
 
@@ -1209,6 +1554,7 @@ def main() -> None:
         improved = mean_val_iou > best_val
         if improved:
             best_val = mean_val_iou
+            best_epoch = epoch
             patience_counter = 0
         else:
             patience_counter += 1
@@ -1229,9 +1575,13 @@ def main() -> None:
             "epoch": epoch,
             "student": student.state_dict(),
             "align": align.state_dict() if align is not None else None,
+            "teacher_align": teacher_align.state_dict() if teacher_align is not None else None,
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict() if use_amp else None,
             "best_val": best_val,
+            "best_epoch": best_epoch,
+            "patience_counter": patience_counter,
+            "completed": False,
             "args": vars(args),
             "neck_channels": (c3, c4, c5),
             "model_type": f"student_{args.student_arch}",
@@ -1246,6 +1596,10 @@ def main() -> None:
             print(f"[early-stop] no improvement for {args.early_stop_patience} epochs, stopping at epoch {epoch}", flush=True)
             break
 
+    (args.output_dir / ".completed").write_text(
+        json.dumps({"last_epoch": last_epoch, "target_epochs": args.epochs}, ensure_ascii=False),
+        encoding="utf-8",
+    )
     print(f"[done] best val_iou={best_val:.4f} output={args.output_dir}", flush=True)
 
 

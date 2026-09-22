@@ -103,6 +103,24 @@ class ProjectionHead(nn.Module):
         return self.net(x)
 
 
+class DenseHead(nn.Module):
+    """3-layer MLP head used for the iBOT / dense patch self-distillation loss."""
+
+    def __init__(self, in_dim: int, hidden_dim: int = 2048, out_dim: int = 2048, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class DINOv3StageAModel(nn.Module):
     """
     Frozen DINOv3 backbone + adapters on selected blocks + projection head.
@@ -122,6 +140,9 @@ class DINOv3StageAModel(nn.Module):
         proj_hidden_dim: int = 2048,
         proj_out_dim: int = 1024,
         proj_dropout: float = 0.0,
+        ibot_hidden_dim: int = 2048,
+        ibot_out_dim: int = 2048,
+        ibot_dropout: float = 0.0,
         freeze_backbone: bool = True,
     ) -> None:
         super().__init__()
@@ -153,6 +174,20 @@ class DINOv3StageAModel(nn.Module):
             out_dim=proj_out_dim,
             dropout=proj_dropout,
         )
+        # Dense (iBOT) heads: one per scale group P3/P4/P5 = consecutive adapter pairs.
+        self.layer_groups = [pos // 2 for pos in range(len(self.adapter_indices))]
+        self.num_ibot_groups = max(self.layer_groups) + 1 if self.layer_groups else 0
+        self.ibot_heads = nn.ModuleDict(
+            {
+                str(g): DenseHead(
+                    in_dim=self.hidden_size,
+                    hidden_dim=ibot_hidden_dim,
+                    out_dim=ibot_out_dim,
+                    dropout=ibot_dropout,
+                )
+                for g in range(self.num_ibot_groups)
+            }
+        )
 
         if freeze_backbone:
             self.freeze_backbone()
@@ -162,12 +197,22 @@ class DINOv3StageAModel(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-    def backbone_hidden_states(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def backbone_hidden_states(
+        self, x: torch.Tensor, bool_masked_pos: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, ...]:
         """
         Run frozen backbone and return hidden states tuple.
+
+        ``bool_masked_pos`` ([B, num_patches], True = masked) is forwarded to the
+        DINOv3 embeddings so masked patches are replaced by the (pretrained) mask token.
         """
         with torch.no_grad():
-            outputs = self.backbone(pixel_values=x, output_hidden_states=True, return_dict=True)
+            outputs = self.backbone(
+                pixel_values=x,
+                output_hidden_states=True,
+                return_dict=True,
+                bool_masked_pos=bool_masked_pos,
+            )
         hs = outputs.hidden_states
         if hs is None:
             raise RuntimeError("Backbone did not return hidden_states.")
@@ -233,6 +278,45 @@ class DINOv3StageAModel(nn.Module):
         hs = self.backbone_hidden_states(x)
         return self.project_from_hidden_states(hs)
 
+    def tokens_to_patch_seq(self, tokens: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """[B, seq, C] -> patch tokens [B, num_patches, C] (drops CLS + register tokens)."""
+        b, seq, c = tokens.shape
+        gh, gw = h // self.patch_size, w // self.patch_size
+        n_patch = gh * gw
+        n_skip = 1 + self.num_register_tokens
+        if seq >= n_skip + n_patch:
+            return tokens[:, n_skip : n_skip + n_patch, :]
+        if seq == n_patch:
+            return tokens
+        if seq > n_patch:
+            return tokens[:, -n_patch:, :]
+        raise RuntimeError(f"Unexpected token shape: seq={seq}, needed patches={n_patch}")
+
+    def forward_dense(
+        self,
+        x: torch.Tensor,
+        bool_masked_pos: torch.Tensor | None = None,
+        return_patch: bool = True,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """Student forward for dense + CLS self-distillation.
+
+        Returns ``(cls_logits, patch_logits_per_adapter_layer)`` where each patch
+        logit tensor is ``[B, num_patches, ibot_out_dim]``. ``bool_masked_pos``
+        ([B, num_patches]) replaces masked patches with the backbone mask token.
+        """
+        b, _, h, w = x.shape
+        hs = self.backbone_hidden_states(x, bool_masked_pos=bool_masked_pos)
+        adapted = self.adapt_hidden_states(hs)
+        cls_logits = self.projector(self.pool_cls(adapted))
+        if not return_patch:
+            return cls_logits, None
+
+        patch_logits = [
+            self.ibot_heads[str(self.layer_groups[i])](self.tokens_to_patch_seq(tokens, h, w))
+            for i, tokens in enumerate(adapted)
+        ]
+        return cls_logits, patch_logits
+
     def adapter_parameters(self) -> Iterable[nn.Parameter]:
         return self.adapters.parameters()
 
@@ -240,5 +324,7 @@ class DINOv3StageAModel(nn.Module):
         for p in self.adapters.parameters():
             yield p
         for p in self.projector.parameters():
+            yield p
+        for p in self.ibot_heads.parameters():
             yield p
 

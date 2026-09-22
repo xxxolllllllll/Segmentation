@@ -39,6 +39,7 @@ SOLUTION_ROOT = ROOT / "solution"
 if str(SOLUTION_ROOT) not in sys.path:
     sys.path.insert(0, str(SOLUTION_ROOT))
 
+from checkpoint_io import torch_load_compat  # noqa: E402
 from folds import build_kfold, discover_samples, load_folds, save_folds  # noqa: E402
 
 
@@ -148,6 +149,116 @@ def run_cmd(cmd: list[str], *, cwd: Path = ROOT) -> None:
     subprocess.run(cmd, cwd=str(cwd), check=True)
 
 
+def _metrics_state(out: Path) -> tuple[int, int] | None:
+    """(last_epoch, patience_counter) recovered from out/epoch_metrics.csv."""
+    csv_path = out / "epoch_metrics.csv"
+    if not csv_path.is_file():
+        return None
+    try:
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return None
+    last_epoch = 0
+    best_epoch = 0
+    prev_best: float | None = None
+    for row in rows:
+        try:
+            ep = int(float(str(row.get("epoch", "")).strip()))
+        except Exception:
+            continue
+        bv: float | None = None
+        for key in ("best_val", "best_iou"):
+            raw = row.get(key)
+            if raw is None or str(raw).strip() == "":
+                continue
+            try:
+                bv = float(str(raw).strip())
+                break
+            except Exception:
+                continue
+        if bv is None:
+            continue
+        last_epoch = max(last_epoch, ep)
+        if prev_best is None or bv > prev_best:
+            prev_best = bv
+            best_epoch = ep
+    if last_epoch <= 0:
+        return None
+    if best_epoch <= 0:
+        best_epoch = last_epoch
+    return last_epoch, max(0, last_epoch - best_epoch)
+
+
+def _ckpt_state(path: Path) -> tuple[int, int] | None:
+    """(epoch, patience_counter) from a checkpoint.
+
+    Recovers patience from the sibling ``best.pt`` (last_epoch - best_epoch) when
+    the checkpoint predates the ``patience_counter`` field.
+    """
+    if not path.is_file():
+        return None
+    try:
+        ckpt = torch_load_compat(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+    epoch = int(ckpt.get("epoch", 0))
+    if "patience_counter" in ckpt:
+        return epoch, int(ckpt["patience_counter"])
+    best_path = path.parent / "best.pt"
+    if best_path.is_file():
+        try:
+            bck = torch_load_compat(best_path, map_location="cpu", weights_only=False)
+            best_epoch = int(bck.get("epoch", 0))
+            if best_epoch > 0:
+                return epoch, max(0, epoch - best_epoch)
+        except Exception:
+            pass
+    return epoch, 0
+
+
+def run_decision(out: Path, target_epochs: int, patience: int) -> tuple[str, Path | None]:
+    """Classify a Stage-B/C output dir.
+
+    Returns (decision, resume_path) where decision is one of
+    ``completed`` (already finished/early-stopped -> skip), ``resume`` (pass
+    ``--resume resume_path``) or ``fresh`` (train from scratch).
+    """
+    best = out / "best.pt"
+    last = out / "last.pt"
+    if (out / ".completed").is_file():
+        return "completed", None
+    state = _metrics_state(out)
+    if state is not None:
+        last_epoch, pat = state
+        if last_epoch >= target_epochs or pat >= patience:
+            return "completed", None
+        if last.is_file():
+            return "resume", last
+        return "fresh", None
+    if last.is_file():
+        ck = _ckpt_state(last)
+        if ck is not None:
+            epoch, cpat = ck
+            if epoch >= target_epochs or cpat >= patience:
+                return "completed", None
+        return "resume", last
+    if best.is_file():
+        return "completed", None
+    return "fresh", None
+
+
+def _mark_completed(out: Path) -> None:
+    """Lazily drop a .completed marker for an already-finished (legacy) run."""
+    marker = out / ".completed"
+    if marker.is_file():
+        return
+    try:
+        marker.write_text(json.dumps({"marked_by": "run_decision"}), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def fold_dir(fold: int) -> Path:
     return KFOLD_ROOT / f"fold{fold}"
 
@@ -188,6 +299,11 @@ def run_stage_a() -> None:
         "--adapter-indices", "3,4,7,8,11,12",
         "--adapter-bottleneck", "64", "--adapter-dropout", "0.1",
         "--proj-hidden-dim", "2048", "--proj-out-dim", "1024", "--proj-dropout", "0.0",
+        "--ibot-hidden-dim", "2048", "--ibot-out-dim", "2048", "--ibot-dropout", "0.0",
+        "--lambda-dino", "1.0", "--lambda-ibot", "1.0",
+        "--ibot-student-temp", "0.1", "--ibot-teacher-temp", "0.04", "--ibot-center-momentum", "0.9",
+        "--mask-ratio", "0.3", "--mask-min-num-patches", "8",
+        "--ibot-diag-every", "100",
         "--num-global-crops", "2", "--num-mid-crops", "2", "--num-local-crops", "4",
         "--elongated-ratio-threshold", "2.5", "--include-ann-prob", "0.85", "--max-crop-aspect", "1.6",
         "--global-crop-size", "448", "--mid-crop-size", "320", "--local-crop-size", "160",
@@ -207,9 +323,12 @@ def run_stage_a() -> None:
 def run_stage_b(fold: int) -> Path:
     out = stage_b_dir(fold)
     best = out / "best.pt"
-    if best.is_file():
-        print(f"[stage-b] fold={fold} skip (best.pt exists): {best}", flush=True)
-        return best
+    last = out / "last.pt"
+    decision, resume_from = run_decision(out, MAX_EPOCHS, EARLY_STOP_PATIENCE)
+    if decision == "completed":
+        _mark_completed(out)
+        print(f"[stage-b] fold={fold} skip (completed)", flush=True)
+        return best if best.is_file() else (last if last.is_file() else out)
     out.mkdir(parents=True, exist_ok=True)
     cmd = [
         PYTHON, str(TRAIN_STAGE_B),
@@ -234,18 +353,24 @@ def run_stage_b(fold: int) -> Path:
         "--positive-patch-ratio", "0.6",
         "--log-every", "10",
     ]
+    if resume_from is not None:
+        cmd += ["--resume", str(resume_from)]
+        print(f"[stage-b] fold={fold} resume from {resume_from}", flush=True)
     run_cmd(cmd)
-    if not best.is_file():
-        raise FileNotFoundError(f"Stage-B training finished but best.pt missing: {best}")
-    return best
+    if not best.is_file() and not last.is_file():
+        raise FileNotFoundError(f"Stage-B training finished but no checkpoint under: {out}")
+    return best if best.is_file() else last
 
 
 def run_stage_c(fold: int, exp: Experiment, stage_b_ckpt: Path | None) -> Path:
     out = exp_dir(fold, exp.paper_id)
     best = out / "best.pt"
-    if best.is_file():
-        print(f"[stage-c] {exp.paper_id} fold={fold} skip (best.pt exists)", flush=True)
-        return best
+    last = out / "last.pt"
+    decision, resume_from = run_decision(out, MAX_EPOCHS, EARLY_STOP_PATIENCE)
+    if decision == "completed":
+        _mark_completed(out)
+        print(f"[stage-c] {exp.paper_id} fold={fold} skip (completed)", flush=True)
+        return best if best.is_file() else (last if last.is_file() else out)
     out.mkdir(parents=True, exist_ok=True)
 
     use_teacher = exp.lambda_feat > 0.0 or exp.lambda_attn > 0.0
@@ -283,10 +408,13 @@ def run_stage_c(fold: int, exp: Experiment, stage_b_ckpt: Path | None) -> Path:
         elif exp.teacher_mode == "stage_b":
             assert stage_b_ckpt is not None
             cmd += ["--teacher-stage-b-ckpt", str(stage_b_ckpt)]
+    if resume_from is not None:
+        cmd += ["--resume", str(resume_from)]
+        print(f"[stage-c] {exp.paper_id} fold={fold} resume from {resume_from}", flush=True)
     run_cmd(cmd)
-    if not best.is_file():
-        raise FileNotFoundError(f"Stage-C training finished but best.pt missing: {best}")
-    return best
+    if not best.is_file() and not last.is_file():
+        raise FileNotFoundError(f"Stage-C training finished but no checkpoint under: {out}")
+    return best if best.is_file() else last
 
 
 def run_eval(fold: int) -> Path | None:

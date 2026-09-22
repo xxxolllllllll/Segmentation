@@ -19,6 +19,7 @@ import math
 import os
 import random
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -657,34 +658,181 @@ class DINOLikeLoss(nn.Module):
         self.center.mul_(self.center_momentum).add_(batch_center * (1.0 - self.center_momentum))
 
 
+def blockwise_mask(gh: int, gw: int, mask_ratio: float, min_num_patches: int, max_num_patches: int) -> torch.Tensor:
+    """BEiT-style block-wise mask. Returns a flattened bool mask [gh*gw], True = masked."""
+    n_total = gh * gw
+    num_masking = max(int(min_num_patches), int(round(n_total * mask_ratio)))
+    num_masking = min(num_masking, n_total)
+    mask = torch.zeros(gh, gw, dtype=torch.bool)
+    if num_masking <= 0:
+        return mask.flatten()
+    max_num_patches = max(int(min_num_patches), min(int(max_num_patches), num_masking))
+    count = 0
+    while count < num_masking:
+        max_mask = min(max_num_patches, num_masking - count)
+        max_mask = max(max_mask, int(min_num_patches))
+        mh = min(random.randint(int(min_num_patches), max_mask), gh)
+        mw = min(random.randint(int(min_num_patches), max_mask), gw)
+        top = random.randint(0, gh - mh)
+        left = random.randint(0, gw - mw)
+        cur = mask[top : top + mh, left : left + mw]
+        n_unmasked = int((~cur).sum())
+        if n_unmasked == 0:
+            continue
+        if n_unmasked > max_mask:
+            flat = cur.flatten()
+            idx = (~flat).nonzero(as_tuple=False).flatten()
+            sel = idx[torch.randperm(idx.numel())[:max_mask]]
+            flat[sel] = True
+            mask[top : top + mh, left : left + mw] = flat.reshape(mh, mw)
+            count += max_mask
+        else:
+            mask[top : top + mh, left : left + mw] = True
+            count += n_unmasked
+    return mask.flatten()
+
+
+def build_block_masks(
+    batch: int,
+    crop_size: int,
+    patch_size: int,
+    mask_ratio: float,
+    min_num_patches: int,
+    max_num_patches: int,
+    device: torch.device,
+) -> torch.Tensor:
+    gh = gw = crop_size // patch_size
+    masks = [blockwise_mask(gh, gw, mask_ratio, min_num_patches, max_num_patches) for _ in range(batch)]
+    return torch.stack(masks, dim=0).to(device)
+
+
+class IBOTLoss(nn.Module):
+    """Dense (iBOT) self-distillation over masked patch tokens, per scale group (P3/P4/P5)."""
+
+    def __init__(
+        self,
+        out_dim: int,
+        num_groups: int = 3,
+        student_temp: float = 0.1,
+        teacher_temp: float = 0.04,
+        center_momentum: float = 0.9,
+    ):
+        super().__init__()
+        self.student_temp = float(student_temp)
+        self.teacher_temp = float(teacher_temp)
+        self.center_momentum = float(center_momentum)
+        self.num_groups = int(num_groups)
+        self.register_buffer("centers", torch.zeros(self.num_groups, out_dim))
+
+    def forward(
+        self,
+        student_patch_logits: list[list[torch.Tensor]],
+        teacher_patch_logits: list[list[torch.Tensor]],
+        masks: list[torch.Tensor],
+        layer_groups: Sequence[int],
+    ) -> torch.Tensor:
+        """Each ``*_patch_logits[v]`` is a list over adapter layers with shape [B, P, K]."""
+        total = torch.zeros((), device=student_patch_logits[0][0].device, dtype=torch.float32)
+        n_terms = 0
+        for s_layers, t_layers, m in zip(student_patch_logits, teacher_patch_logits, masks):
+            if int(m.sum()) == 0:
+                continue
+            for i, (s, t) in enumerate(zip(s_layers, t_layers)):
+                g = int(layer_groups[i])
+                s_m = s[m].float()
+                t_m = t[m].detach().float()
+                target = F.softmax((t_m - self.centers[g].unsqueeze(0)) / self.teacher_temp, dim=-1)
+                logp = F.log_softmax(s_m / self.student_temp, dim=-1)
+                total = total + (-target * logp).sum(-1).mean()
+                n_terms += 1
+        if n_terms == 0:
+            return student_patch_logits[0][0].sum() * 0.0
+        return total / n_terms
+
+    @torch.no_grad()
+    def update_center(
+        self,
+        teacher_patch_logits: list[list[torch.Tensor]],
+        masks: list[torch.Tensor],
+        layer_groups: Sequence[int],
+    ) -> None:
+        vals: dict[int, list[torch.Tensor]] = defaultdict(list)
+        for t_layers, m in zip(teacher_patch_logits, masks):
+            if int(m.sum()) == 0:
+                continue
+            for i, t in enumerate(t_layers):
+                vals[int(layer_groups[i])].append(t[m].detach().float())
+        for g, chunks in vals.items():
+            if not chunks:
+                continue
+            batch_center = torch.cat(chunks, dim=0).mean(dim=0)
+            self.centers[g].mul_(self.center_momentum).add_(batch_center * (1.0 - self.center_momentum))
+
+    @torch.no_grad()
+    def collapse_stats(
+        self,
+        student_patch_logits: list[list[torch.Tensor]],
+        teacher_patch_logits: list[list[torch.Tensor]],
+        masks: list[torch.Tensor],
+        layer_groups: Sequence[int],
+    ) -> dict[str, dict[str, float]]:
+        """Per-group collapse indicators computed on the masked patch tokens."""
+        t_by_g: dict[int, list[torch.Tensor]] = defaultdict(list)
+        s_by_g: dict[int, list[torch.Tensor]] = defaultdict(list)
+        for s_layers, t_layers, m in zip(student_patch_logits, teacher_patch_logits, masks):
+            if int(m.sum()) == 0:
+                continue
+            for i, (s, t) in enumerate(zip(s_layers, t_layers)):
+                g = int(layer_groups[i])
+                t_by_g[g].append(t[m].detach().float())
+                s_by_g[g].append(s[m].detach().float())
+        stats: dict[str, dict[str, float]] = {}
+        for g in sorted(t_by_g):
+            t_all = torch.cat(t_by_g[g], dim=0)
+            s_all = torch.cat(s_by_g[g], dim=0)
+            target = F.softmax((t_all - self.centers[g].unsqueeze(0)) / self.teacher_temp, dim=-1)
+            marg = target.mean(dim=0)
+            marg_entropy = float(-(marg * (marg + 1e-8).log()).sum() / math.log(marg.numel()))
+            stats[str(g)] = {
+                "n_tokens": float(t_all.shape[0]),
+                "marg_entropy": marg_entropy,
+                "mean_max_prob": float(target.max(dim=-1).values.mean()),
+                "student_logit_std": float(s_all.std(dim=0).mean()),
+                "center_norm": float(self.centers[g].norm()),
+            }
+        return stats
+
+
+@torch.no_grad()
+def _ema_update_(target: nn.Module, source: nn.Module, momentum: float) -> None:
+    t_params = dict(target.named_parameters())
+    s_params = dict(source.named_parameters())
+    for name, t in t_params.items():
+        t.data.mul_(momentum).add_(s_params[name].data * (1.0 - momentum))
+    t_buf = dict(target.named_buffers())
+    s_buf = dict(source.named_buffers())
+    for name, t in t_buf.items():
+        t.data.copy_(s_buf[name].data)
+
+
 @dataclass
 class EmaModules:
     adapters: nn.ModuleDict
     projector: nn.Module
+    ibot_heads: nn.ModuleDict
 
     @torch.no_grad()
-    def update_from(self, student_adapters: nn.ModuleDict, student_projector: nn.Module, momentum: float) -> None:
-        s_state = dict(student_adapters.named_parameters())
-        t_state = dict(self.adapters.named_parameters())
-        for name, t in t_state.items():
-            s = s_state[name]
-            t.data.mul_(momentum).add_(s.data * (1.0 - momentum))
-
-        s_buf = dict(student_adapters.named_buffers())
-        t_buf = dict(self.adapters.named_buffers())
-        for name, t in t_buf.items():
-            t.data.copy_(s_buf[name].data)
-
-        s_state = dict(student_projector.named_parameters())
-        t_state = dict(self.projector.named_parameters())
-        for name, t in t_state.items():
-            s = s_state[name]
-            t.data.mul_(momentum).add_(s.data * (1.0 - momentum))
-
-        s_buf = dict(student_projector.named_buffers())
-        t_buf = dict(self.projector.named_buffers())
-        for name, t in t_buf.items():
-            t.data.copy_(s_buf[name].data)
+    def update_from(
+        self,
+        student_adapters: nn.ModuleDict,
+        student_projector: nn.Module,
+        student_ibot_heads: nn.ModuleDict,
+        momentum: float,
+    ) -> None:
+        _ema_update_(self.adapters, student_adapters, momentum)
+        _ema_update_(self.projector, student_projector, momentum)
+        for key in self.ibot_heads:
+            _ema_update_(self.ibot_heads[key], student_ibot_heads[key], momentum)
 
 
 def build_ema_modules(model: DINOv3StageAModel, device: torch.device) -> EmaModules:
@@ -692,13 +840,12 @@ def build_ema_modules(model: DINOv3StageAModel, device: torch.device) -> EmaModu
 
     ema_adapters: nn.ModuleDict = copy.deepcopy(model.adapters).to(device)
     ema_projector: nn.Module = copy.deepcopy(model.projector).to(device)
-    for p in ema_adapters.parameters():
-        p.requires_grad_(False)
-    for p in ema_projector.parameters():
-        p.requires_grad_(False)
-    ema_adapters.eval()
-    ema_projector.eval()
-    return EmaModules(adapters=ema_adapters, projector=ema_projector)
+    ema_ibot_heads: nn.ModuleDict = copy.deepcopy(model.ibot_heads).to(device)
+    for module in (ema_adapters, ema_projector, ema_ibot_heads):
+        for p in module.parameters():
+            p.requires_grad_(False)
+        module.eval()
+    return EmaModules(adapters=ema_adapters, projector=ema_projector, ibot_heads=ema_ibot_heads)
 
 
 def _to_device_crop_list(crops: Sequence[torch.Tensor], device: torch.device) -> list[torch.Tensor]:
@@ -742,8 +889,10 @@ def _save_checkpoint(
         "hidden_size": model.hidden_size,
         "student_adapters": model.adapters.state_dict(),
         "student_projector": model.projector.state_dict(),
+        "student_ibot_head": model.ibot_heads.state_dict(),
         "teacher_adapters_ema": ema.adapters.state_dict(),
         "teacher_projector_ema": ema.projector.state_dict(),
+        "teacher_ibot_head_ema": ema.ibot_heads.state_dict(),
         "optimizer": optimizer.state_dict(),
         "args": vars(args),
     }
@@ -771,6 +920,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--proj-hidden-dim", type=int, default=2048)
     p.add_argument("--proj-out-dim", type=int, default=1024)
     p.add_argument("--proj-dropout", type=float, default=0.0)
+    p.add_argument("--ibot-hidden-dim", type=int, default=2048)
+    p.add_argument("--ibot-out-dim", type=int, default=2048)
+    p.add_argument("--ibot-dropout", type=float, default=0.0)
+    p.add_argument("--lambda-dino", type=float, default=1.0, help="Weight for the CLS-level DINO loss")
+    p.add_argument("--lambda-ibot", type=float, default=1.0, help="Weight for the dense (iBOT) masked-patch loss")
+    p.add_argument("--ibot-student-temp", type=float, default=0.1)
+    p.add_argument("--ibot-teacher-temp", type=float, default=0.04)
+    p.add_argument("--ibot-center-momentum", type=float, default=0.9)
+    p.add_argument("--mask-ratio", type=float, default=0.3, help="Block-wise mask ratio for student global crops (iBOT)")
+    p.add_argument("--mask-min-num-patches", type=int, default=8)
+    p.add_argument("--mask-max-num-patches", type=int, default=0, help="0 = num_masking_patches")
+    p.add_argument(
+        "--ibot-diag-every",
+        type=int,
+        default=0,
+        help="If >0, print per-scale iBOT collapse diagnostics every N steps",
+    )
     p.add_argument("--num-global-crops", type=int, default=2)
     p.add_argument("--num-mid-crops", type=int, default=2)
     p.add_argument("--num-local-crops", type=int, default=4)
@@ -909,6 +1075,9 @@ def main() -> None:
         proj_hidden_dim=args.proj_hidden_dim,
         proj_out_dim=args.proj_out_dim,
         proj_dropout=args.proj_dropout,
+        ibot_hidden_dim=args.ibot_hidden_dim,
+        ibot_out_dim=args.ibot_out_dim,
+        ibot_dropout=args.ibot_dropout,
         freeze_backbone=True,
     ).to(device)
     model.train()
@@ -920,6 +1089,13 @@ def main() -> None:
         student_temp=args.student_temp,
         teacher_temp=args.teacher_temp,
         center_momentum=args.center_momentum,
+    ).to(device)
+    ibot_criterion = IBOTLoss(
+        out_dim=args.ibot_out_dim,
+        num_groups=model.num_ibot_groups,
+        student_temp=args.ibot_student_temp,
+        teacher_temp=args.ibot_teacher_temp,
+        center_momentum=args.ibot_center_momentum,
     ).to(device)
     optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -959,27 +1135,58 @@ def main() -> None:
 
             crops = _to_device_crop_list(crops, device)
 
+            # Block-wise masks for the student global crops (iBOT dense loss).
+            masks: list[torch.Tensor] = []
+            for i in range(global_views):
+                crop_size = int(crops[i].shape[-1])
+                n_patch = (crop_size // model.patch_size) ** 2
+                masks.append(
+                    build_block_masks(
+                        batch=int(crops[i].shape[0]),
+                        crop_size=crop_size,
+                        patch_size=model.patch_size,
+                        mask_ratio=args.mask_ratio,
+                        min_num_patches=args.mask_min_num_patches,
+                        max_num_patches=args.mask_max_num_patches or int(round(n_patch * args.mask_ratio)),
+                        device=device,
+                    )
+                )
+
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp):
-                # teacher on global crops only
+                # Teacher: unmasked global crops -> CLS logits + dense patch logits (EMA).
                 teacher_logits: list[torch.Tensor] = []
-                for i in range(global_views):
-                    hs = model.backbone_hidden_states(crops[i])
-                    adapted = []
-                    for idx in model.adapter_indices:
-                        x = hs[idx]
-                        x = ema.adapters[str(idx)](x)
-                        adapted.append(x)
-                    pooled = model.pool_cls(adapted)
-                    teacher_logits.append(ema.projector(pooled))
+                teacher_patch_logits: list[list[torch.Tensor]] = []
+                with torch.no_grad():
+                    for i in range(global_views):
+                        hh, ww = int(crops[i].shape[-2]), int(crops[i].shape[-1])
+                        hs = model.backbone_hidden_states(crops[i])
+                        adapted = [ema.adapters[str(idx)](hs[idx]) for idx in model.adapter_indices]
+                        teacher_logits.append(ema.projector(model.pool_cls(adapted)))
+                        teacher_patch_logits.append(
+                            [
+                                ema.ibot_heads[str(model.layer_groups[i])](model.tokens_to_patch_seq(tok, hh, ww))
+                                for i, tok in enumerate(adapted)
+                            ]
+                        )
 
-                # student on all crops
+                # Student: masked global crops (dense + CLS) and unmasked other crops (CLS).
                 student_logits: list[torch.Tensor] = []
+                student_patch_logits: list[list[torch.Tensor]] = []
                 for i in range(all_views):
-                    hs = model.backbone_hidden_states(crops[i])
-                    student_logits.append(model.project_from_hidden_states(hs))
+                    if i < global_views:
+                        cls_logits, patch_logits = model.forward_dense(
+                            crops[i], bool_masked_pos=masks[i], return_patch=True
+                        )
+                        student_logits.append(cls_logits)
+                        student_patch_logits.append(patch_logits)  # type: ignore[arg-type]
+                    else:
+                        cls_logits, _ = model.forward_dense(crops[i], bool_masked_pos=None, return_patch=False)
+                        student_logits.append(cls_logits)
 
-                loss = criterion(student_logits=student_logits, teacher_logits=teacher_logits)
+                dino_loss = criterion(student_logits=student_logits, teacher_logits=teacher_logits)
+                ibot_loss = ibot_criterion(student_patch_logits, teacher_patch_logits, masks, model.layer_groups)
+                loss = args.lambda_dino * dino_loss + args.lambda_ibot * ibot_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -987,7 +1194,21 @@ def main() -> None:
 
             with torch.no_grad():
                 criterion.update_center(teacher_logits)
-                ema.update_from(model.adapters, model.projector, momentum=ema_m)
+                ibot_criterion.update_center(teacher_patch_logits, masks, model.layer_groups)
+                ema.update_from(model.adapters, model.projector, model.ibot_heads, momentum=ema_m)
+
+            if args.ibot_diag_every > 0 and (global_step % args.ibot_diag_every == 0):
+                with torch.no_grad():
+                    diag = ibot_criterion.collapse_stats(
+                        student_patch_logits, teacher_patch_logits, masks, model.layer_groups
+                    )
+                parts = " | ".join(
+                    f"P{g} margH={s['marg_entropy']:.3f} maxp={s['mean_max_prob']:.3f} "
+                    f"logitStd={s['student_logit_std']:.3f} cNorm={s['center_norm']:.2f} n={int(s['n_tokens'])}"
+                    for g, s in diag.items()
+                )
+                print(f"[ibot-diag] step={global_step} {parts}", flush=True)
+
 
             step_loss = float(loss.detach().cpu().item())
             running += step_loss
