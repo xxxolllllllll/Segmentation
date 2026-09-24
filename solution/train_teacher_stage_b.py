@@ -197,6 +197,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--images-dir", type=Path, default=None, help="Image directory corresponding to --labelme-dir")
     p.add_argument("--teacher-weights", type=str, default="", help="Local HF DINOv3 directory (with config.json)")
     p.add_argument("--stage-a-ckpt", type=str, default="", help="Optional stage-A checkpoint to initialize adapters")
+    p.add_argument(
+        "--no-adapters",
+        action="store_true",
+        help="Raw-backbone teacher: keep adapters at identity (zero-init residual) without loading Stage-A weights.",
+    )
     p.add_argument("--output-dir", type=Path, default=Path("runs/stage_b_teacher"))
     p.add_argument("--num-classes", type=int, default=4, help="Including background")
     p.add_argument("--imgsz", type=int, default=1024, help="Resize/pad to square; must be divisible by 16")
@@ -912,7 +917,11 @@ def main() -> None:
         bottleneck_dim=args.adapter_bottleneck,
         adapter_dropout=args.adapter_dropout,
     ).to(device)
-    if args.stage_a_ckpt.strip():
+    if args.no_adapters:
+        if args.stage_a_ckpt.strip():
+            print("[info] --no-adapters set: ignoring --stage-a-ckpt (raw-backbone teacher)")
+        print("[info] raw-backbone teacher: adapters kept at identity (no Stage-A weights loaded)")
+    elif args.stage_a_ckpt.strip():
         model.load_stage_a_adapters(args.stage_a_ckpt.strip())
         print(f"[info] loaded stage-A adapters from: {args.stage_a_ckpt}")
 

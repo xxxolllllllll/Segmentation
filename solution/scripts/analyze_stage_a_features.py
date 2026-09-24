@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage-A adapter patch-drift diagnostics")
     p.add_argument("--teacher-weights", type=str, required=True, help="Local HF DINOv3 dir (with config.json)")
     p.add_argument("--stage-a-ckpt", type=Path, required=True, help="Stage-A checkpoint (stage_a_last.pt)")
+    p.add_argument("--stage-a-ckpt-b", type=Path, default=None, help="Optional second Stage-A ckpt for old-vs-new comparison")
     p.add_argument("--labelme-dir", type=Path, required=True)
     p.add_argument("--images-dir", type=Path, default=None, help="Default: same as --labelme-dir")
     p.add_argument("--output-dir", type=Path, default=Path("runs/analysis/stage_a_features"))
@@ -270,12 +271,19 @@ def main() -> int:
         "ema": build_adapters(ckpt, "teacher_adapters_ema", bottleneck, dropout).to(device).eval(),
         "student": build_adapters(ckpt, "student_adapters", bottleneck, dropout).to(device).eval(),
     }
+    if args.stage_a_ckpt_b is not None:
+        ckpt_b = torch_load_compat(args.stage_a_ckpt_b.expanduser().resolve(), map_location="cpu", weights_only=False)
+        b_args = ckpt_b.get("args") or {}
+        adapters["ema_b"] = build_adapters(
+            ckpt_b, "teacher_adapters_ema", int(b_args.get("adapter_bottleneck", 64)), float(b_args.get("adapter_dropout", 0.1))
+        ).to(device).eval()
     backbone = _load_vit_backbone(args.teacher_weights, pretrained=True, device=device).to(device).eval()
     n_register = int(getattr(backbone.config, "num_register_tokens", 0))
     patch_size = int(getattr(backbone.config, "patch_size", 16))
     g = args.img_size // patch_size
 
-    sources = ["raw", "ema", "student"]
+    sources = ["raw", *adapters.keys()]
+    cka_sources = list(adapters.keys())
     # accumulators
     delta_rel: dict[str, dict[int, dict[str, list[float]]]] = {
         s: {l: {"cls": [], "reg": [], "patch": []} for l in layers} for s in sources
@@ -283,7 +291,7 @@ def main() -> int:
     cos_stats: dict[str, dict[int, dict[str, list[float]]]] = {
         s: {l: {"cls": [], "reg": [], "patch": []} for l in layers} for s in sources
     }
-    cka_vals: dict[str, dict[int, list[float]]] = {s: {l: [] for l in layers} for s in ("ema", "student")}
+    cka_vals: dict[str, dict[int, list[float]]] = {s: {l: [] for l in layers} for s in cka_sources}
     fisher_vals: dict[str, dict[int, list[float]]] = {s: {l: [] for l in layers} for s in sources}
     # probe features per (layer, source)
     feats: dict[str, dict[int, list[torch.Tensor]]] = {s: {l: [] for l in layers} for s in sources}
@@ -329,7 +337,7 @@ def main() -> int:
                     else:
                         adapted_tok = adapters[src][str(l)](raw_tok.unsqueeze(0))[0]
                     _, _, _, pmap_a = token_parts(adapted_tok.unsqueeze(0), n_register, g)
-                    if src in ("ema", "student"):
+                    if src != "raw":
                         adapted_pmaps[src] = pmap_a
                     d = (adapted_tok - raw_tok)
                     rel = (d.norm(dim=-1) / (raw_tok.norm(dim=-1) + EPS))
@@ -345,7 +353,7 @@ def main() -> int:
 
                     pflat = pmap_r.reshape(-1, pmap_r.shape[1])
                     pflat_a = pmap_a.reshape(-1, pmap_a.shape[1])
-                    if src in ("ema", "student"):
+                    if src != "raw":
                         cka_vals[src][l].append(linear_cka(pflat, pflat_a))
                     # separability + probe features on selected patches
                     if sel.numel() > 4:
@@ -368,7 +376,7 @@ def main() -> int:
     summary["pos_ratio"] = float(np.mean(pos_ratios)) if pos_ratios else None
     summary["delta_rel"] = {s: {l: {k: float(np.mean(v)) for k, v in delta_rel[s][l].items()} for l in layers} for s in sources}
     summary["cos"] = {s: {l: {k: float(np.mean(v)) for k, v in cos_stats[s][l].items()} for l in layers} for s in sources}
-    summary["cka"] = {s: {l: float(np.mean(v)) if v else None for l, v in cka_vals[s].items()} for s in ("ema", "student")}
+    summary["cka"] = {s: {l: float(np.mean(v)) if v else None for l, v in cka_vals[s].items()} for s in cka_sources}
     summary["fisher"] = {s: {l: float(np.mean(v)) if v else None for l, v in fisher_vals[s].items()} for s in sources}
 
     # probe per layer/source

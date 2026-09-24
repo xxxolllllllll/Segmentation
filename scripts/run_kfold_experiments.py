@@ -285,8 +285,9 @@ def build_folds() -> dict:
 
 
 def run_stage_a() -> None:
-    if STAGE_A_CKPT.is_file():
-        print(f"[stage-a] skip (checkpoint exists): {STAGE_A_CKPT}", flush=True)
+    completed = STAGE_A_RUN_DIR / ".completed"
+    if completed.is_file():
+        print(f"[stage-a] skip (completed): {STAGE_A_RUN_DIR}", flush=True)
         return
     if not STAGE_A_EXTERNAL_DIR.is_dir():
         raise FileNotFoundError(f"Stage-A external pool missing: {STAGE_A_EXTERNAL_DIR}")
@@ -306,7 +307,7 @@ def run_stage_a() -> None:
         "--ibot-diag-every", "100",
         "--num-global-crops", "2", "--num-mid-crops", "2", "--num-local-crops", "4",
         "--elongated-ratio-threshold", "2.5", "--include-ann-prob", "0.85", "--max-crop-aspect", "1.6",
-        "--global-crop-size", "448", "--mid-crop-size", "320", "--local-crop-size", "160",
+        "--global-crop-size", "1024", "--mid-crop-size", "640", "--local-crop-size", "320",
         "--global-normal-side-frac", "0.45,0.80", "--mid-normal-side-frac", "0.25,0.50", "--local-normal-side-frac", "0.10,0.25",
         "--global-short-side-frac", "0.70,1.00", "--global-long-side-frac", "0.20,0.45",
         "--mid-short-side-frac", "0.40,0.80", "--mid-long-side-frac", "0.10,0.25",
@@ -317,6 +318,13 @@ def run_stage_a() -> None:
         "--ema-momentum", "0.996", "--student-temp", "0.1", "--teacher-temp", "0.04", "--center-momentum", "0.9",
         "--seed", "42", "--device", DEVICE,
     ]
+    nproc = int(os.environ.get("STAGE_A_NPROC", "1"))
+    if nproc > 1:
+        cmd = ["torchrun", "--nproc_per_node", str(nproc), str(TRAIN_STAGE_A)] + cmd[2:]
+        print(f"[stage-a] torchrun --nproc_per_node={nproc}", flush=True)
+    if STAGE_A_CKPT.is_file():
+        cmd += ["--resume", "auto"]
+        print(f"[stage-a] resume from {STAGE_A_CKPT}", flush=True)
     run_cmd(cmd)
 
 
@@ -552,12 +560,25 @@ def aggregate() -> None:
     print(f"\n[done] reports -> {REPORT_ROOT}", flush=True)
 
 
+def selected_folds() -> list[int]:
+    """Folds to run this invocation, from FOLD_FILTER (default: all 0..K-1)."""
+    spec = os.environ.get("FOLD_FILTER", "").strip()
+    if not spec:
+        return list(range(K))
+    folds = [int(x.strip()) for x in spec.replace(" ", ",").split(",") if x.strip()]
+    for f in folds:
+        if not (0 <= f < K):
+            raise ValueError(f"FOLD_FILTER fold {f} out of range for K={K}")
+    return folds
+
+
 def main() -> int:
     KFOLD_ROOT.mkdir(parents=True, exist_ok=True)
     experiments = selected_experiments()
     need_stage_a, need_stage_b = teacher_stage_requirements(experiments)
+    folds = selected_folds()
     print(
-        f"[kfold] experiments={[e.paper_id for e in experiments]} "
+        f"[kfold] experiments={[e.paper_id for e in experiments]} folds={folds} "
         f"need_stage_a={need_stage_a} need_stage_b={need_stage_b}",
         flush=True,
     )
@@ -570,13 +591,16 @@ def main() -> int:
     if not need_stage_b:
         print("[stage-b] skip (no selected experiment uses a Stage-B teacher)", flush=True)
 
-    for fold in range(K):
+    for fold in folds:
         stage_b_ckpt = run_stage_b(fold) if need_stage_b else None
         for exp in experiments:
             run_stage_c(fold, exp, stage_b_ckpt if exp.teacher_mode == "stage_b" else None)
         run_eval(fold)
 
-    aggregate()
+    if os.environ.get("SKIP_AGGREGATE", "").strip().lower() in ("1", "true", "yes"):
+        print("[kfold] skip aggregate (SKIP_AGGREGATE set)", flush=True)
+    else:
+        aggregate()
     return 0
 
 

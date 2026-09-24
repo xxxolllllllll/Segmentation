@@ -30,12 +30,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageOps
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from checkpoint_io import torch_load_compat
 from models.dino_stage_a import DINOv3StageAModel
 
 
@@ -49,6 +50,49 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _dist_info() -> tuple[int, int, int, bool]:
+    """(rank, world_size, local_rank, is_dist) from the torchrun environment."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    return rank, world_size, local_rank, world_size > 1
+
+
+def _setup_distributed() -> tuple[int, int, int, bool]:
+    rank, world_size, local_rank, is_dist = _dist_info()
+    if is_dist:
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+    return rank, world_size, local_rank, is_dist
+
+
+def _broadcast_module_(module: nn.Module, src: int = 0) -> None:
+    for p in module.parameters():
+        torch.distributed.broadcast(p.data, src=src)
+    for b in module.buffers():
+        torch.distributed.broadcast(b.data, src=src)
+
+
+def _all_reduce_grads_(params, world_size: int) -> None:
+    if world_size <= 1:
+        return
+    for p in params:
+        if p.grad is None:
+            continue
+        torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.SUM)
+        p.grad.div_(world_size)
+
+
+def _broadcast_tensor_(t: torch.Tensor, src: int = 0) -> None:
+    torch.distributed.broadcast(t, src=src)
+
+
+def _all_reduce_mean_(t: torch.Tensor) -> None:
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+    t.div_(torch.distributed.get_world_size())
 
 
 def clamp_num_workers_windows(args: argparse.Namespace) -> None:
@@ -266,6 +310,17 @@ def _resize_with_aspect_and_pad(x: torch.Tensor, target_size: int) -> torch.Tens
     return x
 
 
+def _pil_pad_to_square(img: Image.Image, target_size: int) -> Image.Image:
+    """Pad a (native-resolution) crop to a fixed square with no scaling."""
+    w, h = img.size
+    if w > target_size or h > target_size:
+        img = img.crop((0, 0, min(w, target_size), min(h, target_size)))
+        w, h = img.size
+    canvas = Image.new("RGB", (target_size, target_size), (0, 0, 0))
+    canvas.paste(img, ((target_size - w) // 2, (target_size - h) // 2))
+    return canvas
+
+
 def _pil_resize_with_aspect_and_pad(img: Image.Image, target_size: int) -> Image.Image:
     """PIL version of aspect-preserving resize+pad to a fixed square.
 
@@ -294,29 +349,35 @@ def _sample_crop_box(
     ann_boxes: Sequence[tuple[int, int, int, int]] | None = None,
     include_ann_prob: float = 0.8,
     max_crop_aspect: float = 1.6,
+    fixed_size: int | None = None,
 ) -> tuple[int, int, int, int]:
-    short_side = min(width, height)
-    long_side = max(width, height)
-    aspect = long_side / max(1, short_side)
-
-    if aspect >= elongated_ratio_threshold:
-        crop_short = int(round(random.uniform(*spec.short_side_frac) * short_side))
-        crop_long = int(round(random.uniform(*spec.long_side_frac) * long_side))
-        if width >= height:
-            crop_w, crop_h = crop_long, crop_short
-        else:
-            crop_w, crop_h = crop_short, crop_long
+    if fixed_size is not None:
+        # Fixed native square crop (no scaling): side = min(target, image dims).
+        side = max(16, min(int(fixed_size), width, height))
+        crop_w = crop_h = side
     else:
-        side = int(round(random.uniform(*spec.normal_side_frac) * short_side))
-        side = max(16, min(side, short_side))
-        crop_w = side
-        crop_h = side
+        short_side = min(width, height)
+        long_side = max(width, height)
+        aspect = long_side / max(1, short_side)
 
-    if max_crop_aspect > 1.0:
-        if crop_w >= crop_h:
-            crop_w = min(crop_w, int(round(crop_h * max_crop_aspect)))
+        if aspect >= elongated_ratio_threshold:
+            crop_short = int(round(random.uniform(*spec.short_side_frac) * short_side))
+            crop_long = int(round(random.uniform(*spec.long_side_frac) * long_side))
+            if width >= height:
+                crop_w, crop_h = crop_long, crop_short
+            else:
+                crop_w, crop_h = crop_short, crop_long
         else:
-            crop_h = min(crop_h, int(round(crop_w * max_crop_aspect)))
+            side = int(round(random.uniform(*spec.normal_side_frac) * short_side))
+            side = max(16, min(side, short_side))
+            crop_w = side
+            crop_h = side
+
+        if max_crop_aspect > 1.0:
+            if crop_w >= crop_h:
+                crop_w = min(crop_w, int(round(crop_h * max_crop_aspect)))
+            else:
+                crop_h = min(crop_h, int(round(crop_w * max_crop_aspect)))
 
     chosen_box: tuple[int, int, int, int] | None = None
     if ann_boxes and random.random() < include_ann_prob:
@@ -362,6 +423,7 @@ class CropTransform:
         color_jitter_strength: float = 0.4,
         include_ann_prob: float = 0.8,
         max_crop_aspect: float = 1.6,
+        resize: bool = True,
     ) -> None:
         from torchvision import transforms as T
 
@@ -369,6 +431,7 @@ class CropTransform:
         self.elongated_ratio_threshold = float(elongated_ratio_threshold)
         self.include_ann_prob = float(include_ann_prob)
         self.max_crop_aspect = float(max_crop_aspect)
+        self.resize = bool(resize)
         self.cj = T.ColorJitter(
             brightness=0.8 * color_jitter_strength,
             contrast=0.8 * color_jitter_strength,
@@ -393,6 +456,7 @@ class CropTransform:
             ann_boxes=ann_boxes,
             include_ann_prob=self.include_ann_prob,
             max_crop_aspect=self.max_crop_aspect,
+            fixed_size=self.spec.target_size if not self.resize else None,
         )
         crop = image.crop(crop_box)
         if random.random() < 0.5:
@@ -404,7 +468,11 @@ class CropTransform:
         if random.random() < 0.3:
             crop = self.blur(crop)
 
-        crop = _pil_resize_with_aspect_and_pad(crop, self.spec.target_size)
+        if self.resize:
+            crop = _pil_resize_with_aspect_and_pad(crop, self.spec.target_size)
+        else:
+            # Native-resolution crop: only pad to square, never rescale.
+            crop = _pil_pad_to_square(crop, self.spec.target_size)
         x = TF.to_tensor(crop)
         x = TF.normalize(x, mean=IMAGENET_MEAN, std=IMAGENET_STD)
         return x
@@ -423,6 +491,7 @@ class MultiCropAug:
         num_global_crops: int = 2,
         num_mid_crops: int = 2,
         num_local_crops: int = 6,
+        resize: bool = True,
     ) -> None:
         self.num_global_crops = num_global_crops
         self.num_mid_crops = num_mid_crops
@@ -432,18 +501,21 @@ class MultiCropAug:
             elongated_ratio_threshold=elongated_ratio_threshold,
             include_ann_prob=include_ann_prob,
             max_crop_aspect=max_crop_aspect,
+            resize=resize,
         )
         self.mid_tf = CropTransform(
             spec=mid_spec,
             elongated_ratio_threshold=elongated_ratio_threshold,
             include_ann_prob=include_ann_prob,
             max_crop_aspect=max_crop_aspect,
+            resize=resize,
         )
         self.local_tf = CropTransform(
             spec=local_spec,
             elongated_ratio_threshold=elongated_ratio_threshold,
             include_ann_prob=include_ann_prob,
             max_crop_aspect=max_crop_aspect,
+            resize=resize,
         )
         self.global_spec = global_spec
         self.mid_spec = mid_spec
@@ -653,8 +725,10 @@ class DINOLikeLoss(nn.Module):
         return total / n_terms
 
     @torch.no_grad()
-    def update_center(self, teacher_logits: list[torch.Tensor]) -> None:
+    def update_center(self, teacher_logits: list[torch.Tensor], reduce: bool = False) -> None:
         batch_center = torch.cat(teacher_logits, dim=0).mean(dim=0, keepdim=True)
+        if reduce:
+            _all_reduce_mean_(batch_center)
         self.center.mul_(self.center_momentum).add_(batch_center * (1.0 - self.center_momentum))
 
 
@@ -755,6 +829,7 @@ class IBOTLoss(nn.Module):
         teacher_patch_logits: list[list[torch.Tensor]],
         masks: list[torch.Tensor],
         layer_groups: Sequence[int],
+        reduce: bool = False,
     ) -> None:
         vals: dict[int, list[torch.Tensor]] = defaultdict(list)
         for t_layers, m in zip(teacher_patch_logits, masks):
@@ -762,11 +837,23 @@ class IBOTLoss(nn.Module):
                 continue
             for i, t in enumerate(t_layers):
                 vals[int(layer_groups[i])].append(t[m].detach().float())
-        for g, chunks in vals.items():
-            if not chunks:
-                continue
-            batch_center = torch.cat(chunks, dim=0).mean(dim=0)
-            self.centers[g].mul_(self.center_momentum).add_(batch_center * (1.0 - self.center_momentum))
+        if not reduce:
+            for g, chunks in vals.items():
+                if not chunks:
+                    continue
+                batch_center = torch.cat(chunks, dim=0).mean(dim=0)
+                self.centers[g].mul_(self.center_momentum).add_(batch_center * (1.0 - self.center_momentum))
+            return
+        # Distributed: fixed collective count across ranks (avoid deadlock when a
+        # rank has no masked tokens for some group).
+        for g in range(self.num_groups):
+            chunks = vals.get(g, [])
+            batch_center = torch.cat(chunks, dim=0).mean(dim=0) if chunks else torch.zeros_like(self.centers[g])
+            count = torch.tensor([1.0 if chunks else 0.0], device=self.centers.device)
+            _all_reduce_mean_(batch_center)
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+            if float(count.item()) > 0.0:
+                self.centers[g].mul_(self.center_momentum).add_(batch_center * (1.0 - self.center_momentum))
 
     @torch.no_grad()
     def collapse_stats(
@@ -881,6 +968,9 @@ def _save_checkpoint(
     ema: EmaModules,
     optimizer: torch.optim.Optimizer,
     args: argparse.Namespace,
+    dino_loss: DINOLikeLoss,
+    ibot_loss: IBOTLoss,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> Path:
     ckpt = {
         "epoch": epoch,
@@ -893,7 +983,10 @@ def _save_checkpoint(
         "teacher_adapters_ema": ema.adapters.state_dict(),
         "teacher_projector_ema": ema.projector.state_dict(),
         "teacher_ibot_head_ema": ema.ibot_heads.state_dict(),
+        "dino_center": dino_loss.center.detach().cpu(),
+        "ibot_centers": ibot_loss.centers.detach().cpu(),
         "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict() if scaler is not None else None,
         "args": vars(args),
     }
     path = output_dir / f"stage_a_epoch_{epoch:03d}.pt"
@@ -912,6 +1005,12 @@ def parse_args() -> argparse.Namespace:
         help="One or more roots. Supports image files and LabelMe JSON files.",
     )
     p.add_argument("--output-dir", type=Path, default=Path("runs/stage_a"))
+    p.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help="Resume from a Stage-A checkpoint path, or 'auto' for <output-dir>/stage_a_last.pt",
+    )
     p.add_argument("--teacher-weights", type=str, default="", help="Local HF DINOv3 directory with config.json")
     p.add_argument("--teacher-no-pretrained", action="store_true")
     p.add_argument("--adapter-indices", type=str, default="3,4,7,8,11,12")
@@ -943,9 +1042,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--elongated-ratio-threshold", type=float, default=2.5)
     p.add_argument("--include-ann-prob", type=float, default=0.85, help="Probability of sampling a crop that covers an annotation box when LabelMe shapes are available")
     p.add_argument("--max-crop-aspect", type=float, default=1.6, help="Upper bound of crop box aspect ratio (long/short) before square padding")
-    p.add_argument("--global-crop-size", type=int, default=448)
-    p.add_argument("--mid-crop-size", type=int, default=320)
-    p.add_argument("--local-crop-size", type=int, default=160)
+    p.add_argument("--global-crop-size", type=int, default=1024)
+    p.add_argument("--mid-crop-size", type=int, default=640)
+    p.add_argument("--local-crop-size", type=int, default=320)
+    p.add_argument(
+        "--crop-resize",
+        action="store_true",
+        help="Resize each crop to its target size (old behavior). Default: native-resolution crop + pad only (no scaling).",
+    )
     p.add_argument("--global-normal-side-frac", type=str, default="0.45,0.80")
     p.add_argument("--mid-normal-side-frac", type=str, default="0.25,0.50")
     p.add_argument("--local-normal-side-frac", type=str, default="0.10,0.25")
@@ -985,10 +1089,13 @@ def main() -> None:
     args = parse_args()
     clamp_num_workers_windows(args)
     set_seed(args.seed)
+    rank, world_size, local_rank, is_dist = _setup_distributed()
+    is_main = rank == 0
 
     roots = _resolve_roots(args.input_roots)
     samples = discover_samples(roots)
-    print(f"[info] found {len(samples)} samples from {len(roots)} roots")
+    if is_main:
+        print(f"[info] found {len(samples)} samples from {len(roots)} roots | world_size={world_size}", flush=True)
 
     adapter_indices = _parse_int_list(args.adapter_indices)
     global_spec = CropSpec(
@@ -1023,12 +1130,18 @@ def main() -> None:
         num_global_crops=args.num_global_crops,
         num_mid_crops=args.num_mid_crops,
         num_local_crops=args.num_local_crops,
+        resize=bool(args.crop_resize),
     )
     if args.viz_samples > 0:
         viz_dir = args.viz_crops_dir if args.viz_crops_dir is not None else args.output_dir / "multicrop_preview"
-        save_multicrop_previews(samples, aug, viz_dir.expanduser().resolve(), args.viz_samples)
+        if is_main:
+            save_multicrop_previews(samples, aug, viz_dir.expanduser().resolve(), args.viz_samples)
         if args.preview_only:
-            print("[info] preview-only enabled, exiting before training.")
+            if is_main:
+                print("[info] preview-only enabled, exiting before training.")
+            if is_dist:
+                torch.distributed.barrier()
+                torch.distributed.destroy_process_group()
             return
     ds = UnlabeledMultiCropDataset(
         samples,
@@ -1043,14 +1156,21 @@ def main() -> None:
             "[warn] cache-images=ram with num_workers>0 duplicates cache per worker process; "
             "consider num_workers=0 or cache-images=none if RAM usage is high."
         )
-    device = torch.device(args.device)
+    device = torch.device("cuda", local_rank) if is_dist else torch.device(args.device)
+    sampler = None
+    if is_dist:
+        sampler = DistributedSampler(
+            ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed, drop_last=True
+        )
     loader_kwargs: dict = dict(
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         drop_last=True,
     )
+    if sampler is not None:
+        loader_kwargs["sampler"] = sampler
     if args.num_workers > 0:
         loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
@@ -1100,16 +1220,76 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     use_amp = (not args.no_amp) and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    # bf16 autocast (no GradScaler): keeps ranks consistent under DDP grad averaging.
+    scaler = None
+    if is_dist:
+        for m in (model.adapters, model.projector, model.ibot_heads, ema.adapters, ema.projector, ema.ibot_heads):
+            _broadcast_module_(m)
+        _broadcast_tensor_(criterion.center)
+        _broadcast_tensor_(ibot_criterion.centers)
 
     args.output_dir = args.output_dir.expanduser().resolve()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[info] output dir: {args.output_dir}")
+    if is_main:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+    if is_dist:
+        torch.distributed.barrier()
+    if is_main:
+        print(f"[info] output dir: {args.output_dir}")
 
     loss_steps_csv = args.output_dir / "loss_steps.csv"
     loss_epoch_csv = args.output_dir / "epoch_metrics.csv"
-    _prepare_csv(loss_steps_csv, LOSS_STEP_FIELDS)
-    _prepare_csv(loss_epoch_csv, LOSS_EPOCH_FIELDS)
+    if is_main:
+        _prepare_csv(loss_steps_csv, LOSS_STEP_FIELDS)
+        _prepare_csv(loss_epoch_csv, LOSS_EPOCH_FIELDS)
+    if is_dist:
+        torch.distributed.barrier()
+
+    # ---- resume ----
+    start_epoch = 1
+    resume_path: Path | None = None
+    if args.resume.strip():
+        resume_path = (
+            args.output_dir / "stage_a_last.pt"
+            if args.resume.strip() == "auto"
+            else Path(args.resume).expanduser().resolve()
+        )
+    if resume_path is not None and resume_path.is_file():
+        ckpt = torch_load_compat(resume_path, map_location="cpu", weights_only=False)
+        if "student_adapters" in ckpt and "student_ibot_head" in ckpt:
+            model.adapters.load_state_dict(ckpt["student_adapters"], strict=True)
+            model.projector.load_state_dict(ckpt["student_projector"], strict=True)
+            model.ibot_heads.load_state_dict(ckpt["student_ibot_head"], strict=True)
+            if ckpt.get("teacher_adapters_ema") is not None:
+                ema.adapters.load_state_dict(ckpt["teacher_adapters_ema"], strict=True)
+            if ckpt.get("teacher_projector_ema") is not None:
+                ema.projector.load_state_dict(ckpt["teacher_projector_ema"], strict=True)
+            if ckpt.get("teacher_ibot_head_ema") is not None:
+                ema.ibot_heads.load_state_dict(ckpt["teacher_ibot_head_ema"], strict=True)
+            if ckpt.get("optimizer") is not None:
+                optimizer.load_state_dict(ckpt["optimizer"])
+            if scaler is not None and ckpt.get("scaler") is not None:
+                scaler.load_state_dict(ckpt["scaler"])
+            if ckpt.get("dino_center") is not None:
+                criterion.center.copy_(ckpt["dino_center"].to(criterion.center.device))
+            if ckpt.get("ibot_centers") is not None:
+                ibot_criterion.centers.copy_(ckpt["ibot_centers"].to(ibot_criterion.centers.device))
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            print(f"[resume] {resume_path} -> start_epoch={start_epoch}", flush=True)
+        else:
+            print(f"[resume] incompatible checkpoint (pre-iBOT?), starting fresh: {resume_path}", flush=True)
+    elif resume_path is not None:
+        print(f"[resume] checkpoint not found, starting fresh: {resume_path}", flush=True)
+
+    if start_epoch > args.epochs:
+        if is_main:
+            print(f"[resume] start_epoch={start_epoch} > epochs={args.epochs}; nothing to do", flush=True)
+            (args.output_dir / ".completed").write_text(
+                json.dumps({"last_epoch": args.epochs, "target_epochs": args.epochs}), encoding="utf-8"
+            )
+        if is_dist:
+            torch.distributed.barrier()
+            torch.distributed.destroy_process_group()
+        return
 
     global_views = args.num_global_crops
     all_views = args.num_global_crops + args.num_mid_crops + args.num_local_crops
@@ -1117,12 +1297,16 @@ def main() -> None:
         raise ValueError("Need at least 1 global crop and at least one additional crop.")
 
     global_step = 0
-    for epoch in range(1, args.epochs + 1):
+    last_epoch = start_epoch - 1
+    for epoch in range(start_epoch, args.epochs + 1):
+        last_epoch = epoch
         model.train()
         model.backbone.eval()
         running = 0.0
         n_steps = 0
         ema_m = cosine_ema_momentum(epoch - 1, args.epochs, args.ema_momentum)
+        if sampler is not None:
+            sampler.set_epoch(epoch)
 
         for crops in loader:
             if args.max_steps > 0 and n_steps >= args.max_steps:
@@ -1153,7 +1337,7 @@ def main() -> None:
                 )
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                 # Teacher: unmasked global crops -> CLS logits + dense patch logits (EMA).
                 teacher_logits: list[torch.Tensor] = []
                 teacher_patch_logits: list[list[torch.Tensor]] = []
@@ -1188,16 +1372,16 @@ def main() -> None:
                 ibot_loss = ibot_criterion(student_patch_logits, teacher_patch_logits, masks, model.layer_groups)
                 loss = args.lambda_dino * dino_loss + args.lambda_ibot * ibot_loss
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            loss.backward()
+            _all_reduce_grads_(model.trainable_parameters(), world_size)
+            optimizer.step()
 
             with torch.no_grad():
-                criterion.update_center(teacher_logits)
-                ibot_criterion.update_center(teacher_patch_logits, masks, model.layer_groups)
+                criterion.update_center(teacher_logits, reduce=is_dist)
+                ibot_criterion.update_center(teacher_patch_logits, masks, model.layer_groups, reduce=is_dist)
                 ema.update_from(model.adapters, model.projector, model.ibot_heads, momentum=ema_m)
 
-            if args.ibot_diag_every > 0 and (global_step % args.ibot_diag_every == 0):
+            if is_main and args.ibot_diag_every > 0 and (global_step % args.ibot_diag_every == 0):
                 with torch.no_grad():
                     diag = ibot_criterion.collapse_stats(
                         student_patch_logits, teacher_patch_logits, masks, model.layer_groups
@@ -1214,8 +1398,9 @@ def main() -> None:
             running += step_loss
             n_steps += 1
             global_step += 1
-            _append_csv_row(loss_steps_csv, [global_step, epoch, f"{step_loss:.6f}"])
-            if args.log_every > 0 and n_steps % args.log_every == 0:
+            if is_main:
+                _append_csv_row(loss_steps_csv, [global_step, epoch, f"{step_loss:.6f}"])
+            if is_main and args.log_every > 0 and n_steps % args.log_every == 0:
                 print(
                     f"[epoch {epoch:03d}/{args.epochs}] step {n_steps}/{len(loader)} "
                     f"loss={running / n_steps:.6f} ema_m={ema_m:.6f}",
@@ -1223,12 +1408,29 @@ def main() -> None:
                 )
 
         epoch_loss = running / max(1, n_steps)
-        print(f"[epoch {epoch:03d}/{args.epochs}] loss={epoch_loss:.6f} ema_m={ema_m:.6f}")
-        _append_csv_row(loss_epoch_csv, [epoch, f"{epoch_loss:.6f}", f"{ema_m:.6f}"])
+        if is_main:
+            print(f"[epoch {epoch:03d}/{args.epochs}] loss={epoch_loss:.6f} ema_m={ema_m:.6f}")
+            _append_csv_row(loss_epoch_csv, [epoch, f"{epoch_loss:.6f}", f"{ema_m:.6f}"])
 
         if (epoch % args.save_every == 0) or (epoch == args.epochs):
-            path = _save_checkpoint(args.output_dir, epoch, model, ema, optimizer, args)
-            print(f"[ckpt] saved: {path}")
+            if is_dist:
+                torch.distributed.barrier()
+            if is_main:
+                path = _save_checkpoint(args.output_dir, epoch, model, ema, optimizer, args, criterion, ibot_criterion, scaler)
+                print(f"[ckpt] saved: {path}")
+            if is_dist:
+                torch.distributed.barrier()
+
+    if last_epoch >= args.epochs:
+        if is_main:
+            (args.output_dir / ".completed").write_text(
+                json.dumps({"last_epoch": last_epoch, "target_epochs": args.epochs}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            print(f"[done] Stage-A complete at epoch {last_epoch}", flush=True)
+    if is_dist:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
