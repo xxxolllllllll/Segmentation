@@ -97,7 +97,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--labelme-dir", type=Path, default=Path("tmp/labelme_datasets/test"))
     p.add_argument("--images-dir", type=Path, default=None, help="Default: same as --labelme-dir")
     p.add_argument("--output-dir", type=Path, default=Path("runs/eval_labelme_test"))
-    p.add_argument("--stage-b-ckpt", type=Path, default=None)
+    p.add_argument(
+        "--stage-b-ckpt",
+        action="append",
+        default=[],
+        help="[NAME=]PATH to Stage-B teacher best.pt; repeatable (e.g. stage_b_raw=.../best.pt)",
+    )
     p.add_argument("--teacher-weights", type=str, default="solution/weights/dinov3-vitb16-pretrain-lvd1689m")
     p.add_argument(
         "--student-ckpt",
@@ -456,27 +461,31 @@ def main() -> int:
     for item in args.student_ckpt:
         student_ckpts.append(parse_name_path(item))
 
-    if not student_ckpts and not args.stage_b_ckpt:
+    teacher_ckpts: list[tuple[str, Path]] = []
+    for item in args.stage_b_ckpt:
+        teacher_ckpts.append(parse_name_path(item))
+
+    if not student_ckpts and not teacher_ckpts:
         student_ckpts = [
             ("S0", Path("solution/runs/stage_c_semantic_yolo_unet_attn/S0/best.pt")),
             ("S4", Path("solution/runs/stage_c_semantic_yolo_unet_attn/S4/best.pt")),
             ("S5", Path("solution/runs/stage_c_semantic_yolo_unet_attn/S5/best.pt")),
         ]
-        args.stage_b_ckpt = Path("solution/runs/stage_b_teacher_crack_cp/best.pt")
+        teacher_ckpts = [("stage_b", Path("solution/runs/stage_b_teacher_crack_cp/best.pt"))]
 
     stride = int(args.stride)
     results: list[dict[str, Any]] = []
 
-    if args.stage_b_ckpt is not None:
-        ckpt = args.stage_b_ckpt.expanduser().resolve()
+    for tname, tpath in teacher_ckpts:
+        ckpt = tpath.expanduser().resolve()
         if not ckpt.is_file():
             raise FileNotFoundError(f"Stage-B checkpoint not found: {ckpt}")
         teacher, teacher_imgsz = load_stage_b(ckpt, args.teacher_weights, device)
         imgsz = int(args.imgsz or teacher_imgsz)
-        print(f"[eval] Stage-B teacher imgsz={imgsz} stride={stride} n={len(samples)}", flush=True)
+        print(f"[eval] {tname} (teacher) imgsz={imgsz} stride={stride} n={len(samples)}", flush=True)
         results.append(
             evaluate_model(
-                "stage_b",
+                tname,
                 "teacher",
                 teacher,
                 imgsz=imgsz,

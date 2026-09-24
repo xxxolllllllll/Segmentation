@@ -43,8 +43,9 @@ class ConvBlock(nn.Module):
 
 class DINOv3StageBUNet(nn.Module):
     """
-    Stage-B teacher fine-tuning model:
-    frozen DINOv3 backbone + trainable adapters + U-Net-like decoder.
+    Stage-B teacher:
+    frozen DINOv3 backbone + trainable adapters + scale-transform bridge (FPN)
+    + FPN decoder producing multi-scale (H/8, H/16, H/32) bridge targets.
     """
 
     _IDX_LOW = (3, 4)
@@ -92,16 +93,29 @@ class DINOv3StageBUNet(nn.Module):
         self.fuse_mid = PairAdaptiveFuse(self.hidden_size)
         self.fuse_deep = PairAdaptiveFuse(self.hidden_size)
 
-        # Bridge layers.
-        self.bridge_low = nn.Sequential(nn.Conv2d(self.hidden_size, 128, 1), nn.GELU())
-        self.bridge_mid = nn.Sequential(nn.Conv2d(self.hidden_size, 192, 1), nn.GELU())
-        self.bridge_deep = nn.Sequential(nn.Conv2d(self.hidden_size, 256, 1), nn.GELU())
+        # Scale-transform bridge: shallow -> H/8 (2x up), mid -> H/16 (same),
+        # deep -> H/32 (2x down), matching the student neck P3/P4/P5 pyramid.
+        self.bridge_low = nn.Sequential(
+            nn.ConvTranspose2d(self.hidden_size, 128, kernel_size=4, stride=2, padding=1), nn.GELU()
+        )  # H/16 -> H/8, 128 ch
+        self.bridge_mid = nn.Sequential(nn.Conv2d(self.hidden_size, 192, kernel_size=1), nn.GELU())  # H/16, 192 ch
+        self.bridge_deep = nn.Sequential(
+            nn.Conv2d(self.hidden_size, 256, kernel_size=3, stride=2, padding=1), nn.GELU()
+        )  # H/16 -> H/32, 256 ch
 
-        # U-Net-like decoder.
-        self.dec8 = ConvBlock(256 + 192, 192)   # H/8
-        self.dec4 = ConvBlock(192 + 128, 128)   # H/4
-        self.dec2 = ConvBlock(128, 64)          # H/2
-        self.dec1 = ConvBlock(64, 64)           # H
+        # FPN decoder: lateral 1x1 + top-down + smooth.
+        fpn = 256
+        self.lat_low = nn.Conv2d(128, fpn, kernel_size=1)
+        self.lat_mid = nn.Conv2d(192, fpn, kernel_size=1)
+        self.lat_deep = nn.Conv2d(256, fpn, kernel_size=1)
+        self.smooth_low = ConvBlock(fpn, fpn)
+        self.smooth_mid = ConvBlock(fpn, fpn)
+        self.smooth_deep = ConvBlock(fpn, fpn)
+
+        # Decoder up path (H/8 -> H/4 -> H/2 -> H).
+        self.dec4 = ConvBlock(fpn, 128)  # H/4
+        self.dec2 = ConvBlock(128, 64)   # H/2
+        self.dec1 = ConvBlock(64, 64)    # H
         self.head = nn.Conv2d(64, self.num_classes, kernel_size=1)
 
     def _tokens_to_map(self, tokens: torch.Tensor, h: int, w: int) -> torch.Tensor:
@@ -167,7 +181,12 @@ class DINOv3StageBUNet(nn.Module):
             self.bridge_low,
             self.bridge_mid,
             self.bridge_deep,
-            self.dec8,
+            self.lat_low,
+            self.lat_mid,
+            self.lat_deep,
+            self.smooth_low,
+            self.smooth_mid,
+            self.smooth_deep,
             self.dec4,
             self.dec2,
             self.dec1,
@@ -188,18 +207,30 @@ class DINOv3StageBUNet(nn.Module):
         mid = self.fuse_mid(mid7, mid8)
         deep = self.fuse_deep(dep11, dep12)
 
-        low = self.bridge_low(low)    # H/16, 128 ch
-        mid = self.bridge_mid(mid)    # H/16, 192 ch
-        deep = self.bridge_deep(deep)  # H/16, 256 ch
+        low = self.bridge_low(low)    # H/8, 128 ch  (scale transform: 2x up)
+        mid = self.bridge_mid(mid)    # H/16, 192 ch (same scale)
+        deep = self.bridge_deep(deep)  # H/32, 256 ch (scale transform: 2x down)
         return low, mid, deep
+
+    def _fpn_pyramid(
+        self, hs: Sequence[torch.Tensor], h: int, w: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """FPN lateral + top-down + smooth -> (p3@H/8, p4@H/16, p5@H/32), all fpn-width."""
+        low, mid, deep = self._bridge_maps(hs, h, w)
+        p5 = self.lat_deep(deep)
+        p4 = self.lat_mid(mid) + F.interpolate(p5, scale_factor=2.0, mode="nearest")
+        p3 = self.lat_low(low) + F.interpolate(p4, scale_factor=2.0, mode="nearest")
+        p5 = self.smooth_deep(p5)
+        p4 = self.smooth_mid(p4)
+        p3 = self.smooth_low(p3)
+        return p3, p4, p5
 
     @torch.no_grad()
     def extract_bridge_feature_maps(self, x: torch.Tensor) -> list[torch.Tensor]:
-        """Return Stage-B bridge feature maps [bridge_low, bridge_mid, bridge_deep].
+        """Return the Stage-B FPN pyramid ``[p3, p4, p5]`` (H/8, H/16, H/32).
 
-        Used as the S3/S3_attn distillation target. Adapters are frozen, and the
-        fused/bridged maps carry the segmentation-aware representation learned in
-        Stage B.
+        Used as the S3/S3_attn distillation target: segmentation-aware features
+        *after* the FPN lateral + top-down + smooth stages (adapters frozen).
         """
         b, _, h, w = x.shape
         if h % self.patch_size != 0 or w % self.patch_size != 0:
@@ -209,8 +240,8 @@ class DINOv3StageBUNet(nn.Module):
         hs = out.hidden_states
         if hs is None:
             raise RuntimeError("Backbone did not return hidden_states")
-        low, mid, deep = self._bridge_maps(hs, h=h, w=w)
-        return [low, mid, deep]
+        p3, p4, p5 = self._fpn_pyramid(hs, h=h, w=w)
+        return [p3, p4, p5]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, _, h, w = x.shape
@@ -223,20 +254,12 @@ class DINOv3StageBUNet(nn.Module):
         if hs is None:
             raise RuntimeError("Backbone did not return hidden_states")
 
-        low, mid, deep = self._bridge_maps(hs, h, w)
+        p3, _, _ = self._fpn_pyramid(hs, h, w)
 
-        x8 = F.interpolate(deep, scale_factor=2.0, mode="bilinear", align_corners=False)
-        s8 = F.interpolate(mid, scale_factor=2.0, mode="bilinear", align_corners=False)
-        x8 = self.dec8(torch.cat([x8, s8], dim=1))
-
-        x4 = F.interpolate(x8, scale_factor=2.0, mode="bilinear", align_corners=False)
-        s4 = F.interpolate(low, scale_factor=4.0, mode="bilinear", align_corners=False)
-        x4 = self.dec4(torch.cat([x4, s4], dim=1))
-
-        x2 = F.interpolate(x4, scale_factor=2.0, mode="bilinear", align_corners=False)
-        x2 = self.dec2(x2)
-        x1 = F.interpolate(x2, scale_factor=2.0, mode="bilinear", align_corners=False)
-        x1 = self.dec1(x1)
+        # Progressive upsampling to the input resolution.
+        x4 = self.dec4(F.interpolate(p3, scale_factor=2.0, mode="bilinear", align_corners=False))  # H/4
+        x2 = self.dec2(F.interpolate(x4, scale_factor=2.0, mode="bilinear", align_corners=False))  # H/2
+        x1 = self.dec1(F.interpolate(x2, scale_factor=2.0, mode="bilinear", align_corners=False))  # H
         logits = self.head(x1)
         return logits
 

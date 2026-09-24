@@ -91,16 +91,17 @@ class Experiment:
     lambda_attn: float
     student_arch: str = "yolo_unet"
     student_scratch: bool = False
+    teacher_ckpt: str = ""  # for teacher_mode="stage_b": "raw" | "adapted"
 
 
 EXPERIMENTS = [
     Experiment("S0", "raw_vit", 0.0, 0.0, student_scratch=True),
-    Experiment("S1", "raw_vit", 0.5, 0.0, student_scratch=True),
-    Experiment("S1_attn", "raw_vit", 0.5, 0.2, student_scratch=True),
-    Experiment("S2", "stage_a", 0.5, 0.0, student_scratch=True),
-    Experiment("S2_attn", "stage_a", 0.5, 0.2, student_scratch=True),
-    Experiment("S3", "stage_b", 0.5, 0.0, student_scratch=True),
-    Experiment("S3_attn", "stage_b", 0.5, 0.2, student_scratch=True),
+    # S1 = Stage-B teacher WITHOUT Stage-A adaptation (raw backbone -> fusion -> bridge -> FPN decoder)
+    Experiment("S1", "stage_b", 0.5, 0.0, student_scratch=True, teacher_ckpt="raw"),
+    Experiment("S1_attn", "stage_b", 0.5, 0.2, student_scratch=True, teacher_ckpt="raw"),
+    # S2 = Stage-B teacher WITH Stage-A adaptation
+    Experiment("S2", "stage_b", 0.5, 0.0, student_scratch=True, teacher_ckpt="adapted"),
+    Experiment("S2_attn", "stage_b", 0.5, 0.2, student_scratch=True, teacher_ckpt="adapted"),
     # Architecture-comparison baselines (no distillation; same protocol as S0, from scratch).
     Experiment("YOLOSeg", "raw_vit", 0.0, 0.0, student_arch="yolo_seg"),
     Experiment("UNet", "raw_vit", 0.0, 0.0, student_arch="unet"),
@@ -125,22 +126,27 @@ def experiment_uses_teacher(exp: Experiment) -> bool:
     return exp.lambda_feat > 0.0 or exp.lambda_attn > 0.0
 
 
-def teacher_stage_requirements(experiments: list[Experiment]) -> tuple[bool, bool]:
-    """Return (need_stage_a, need_stage_b) for the selected experiments."""
+def teacher_stage_requirements(experiments: list[Experiment]) -> tuple[bool, set[str]]:
+    """Return (need_stage_a, stage_b_variants) for the selected experiments.
+
+    ``stage_b_variants`` is the set of Stage-B teacher variants to train, e.g.
+    {"raw", "adapted"} ("raw" = no Stage-A adapters; "adapted" = load Stage-A).
+    """
     teach = [e for e in experiments if experiment_uses_teacher(e)]
-    need_stage_a = any(e.teacher_mode in ("stage_a", "stage_b") for e in teach)
-    need_stage_b = any(e.teacher_mode == "stage_b" for e in teach)
-    return need_stage_a, need_stage_b
+    variants = {e.teacher_ckpt for e in teach if e.teacher_mode == "stage_b"}
+    need_stage_a = "adapted" in variants
+    return need_stage_a, variants
 
 
 def available_models(fold: int) -> list[str]:
-    """All checkpoints currently present for a fold (students + optional stage_b)."""
+    """All checkpoints currently present for a fold (students + optional stage_b teachers)."""
     models: list[str] = []
     for exp in EXPERIMENTS:
         if (exp_dir(fold, exp.paper_id) / "best.pt").is_file():
             models.append(exp.paper_id)
-    if (stage_b_dir(fold) / "best.pt").is_file():
-        models.append("stage_b")
+    for variant in ("raw", "adapted"):
+        if (stage_b_dir(fold, variant) / "best.pt").is_file():
+            models.append(f"stage_b_{variant}")
     return models
 
 
@@ -263,8 +269,9 @@ def fold_dir(fold: int) -> Path:
     return KFOLD_ROOT / f"fold{fold}"
 
 
-def stage_b_dir(fold: int) -> Path:
-    return fold_dir(fold) / "stage_b"
+def stage_b_dir(fold: int, variant: str = "adapted") -> Path:
+    """Stage-B teacher dir for a variant: pure_dir/fold{fold}/stage_b_{raw|adapted}."""
+    return fold_dir(fold) / f"stage_b_{variant}"
 
 
 def exp_dir(fold: int, exp_id: str) -> Path:
@@ -328,14 +335,14 @@ def run_stage_a() -> None:
     run_cmd(cmd)
 
 
-def run_stage_b(fold: int) -> Path:
-    out = stage_b_dir(fold)
+def run_stage_b(fold: int, variant: str) -> Path:
+    out = stage_b_dir(fold, variant)
     best = out / "best.pt"
     last = out / "last.pt"
     decision, resume_from = run_decision(out, MAX_EPOCHS, EARLY_STOP_PATIENCE)
     if decision == "completed":
         _mark_completed(out)
-        print(f"[stage-b] fold={fold} skip (completed)", flush=True)
+        print(f"[stage-b] fold={fold} variant={variant} skip (completed)", flush=True)
         return best if best.is_file() else (last if last.is_file() else out)
     out.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -343,7 +350,6 @@ def run_stage_b(fold: int) -> Path:
         "--labelme-dir", str(LABELME_ALL_DIR),
         "--images-dir", str(LABELME_ALL_DIR),
         "--teacher-weights", str(DINO_WEIGHTS),
-        "--stage-a-ckpt", str(STAGE_A_CKPT),
         "--output-dir", str(out),
         "--num-classes", "2",
         "--imgsz", str(IMGSZ),
@@ -361,9 +367,13 @@ def run_stage_b(fold: int) -> Path:
         "--positive-patch-ratio", "0.6",
         "--log-every", "10",
     ]
+    if variant == "raw":
+        cmd += ["--no-adapters"]
+    else:
+        cmd += ["--stage-a-ckpt", str(STAGE_A_CKPT)]
     if resume_from is not None:
         cmd += ["--resume", str(resume_from)]
-        print(f"[stage-b] fold={fold} resume from {resume_from}", flush=True)
+        print(f"[stage-b] fold={fold} variant={variant} resume from {resume_from}", flush=True)
     run_cmd(cmd)
     if not best.is_file() and not last.is_file():
         raise FileNotFoundError(f"Stage-B training finished but no checkpoint under: {out}")
@@ -453,11 +463,14 @@ def run_eval(fold: int) -> Path | None:
         "--stride", str(VAL_STRIDE),
         "--device", DEVICE,
     ]
-    if "stage_b" in models:
-        cmd += ["--stage-b-ckpt", str(stage_b_dir(fold) / "best.pt")]
+    teacher_names = [m for m in models if m.startswith("stage_b_")]
+    if teacher_names:
+        for tn in teacher_names:
+            variant = tn[len("stage_b_") :]
+            cmd += ["--stage-b-ckpt", f"{tn}={stage_b_dir(fold, variant) / 'best.pt'}"]
         cmd += ["--teacher-weights", str(DINO_WEIGHTS)]
     for model in models:
-        if model == "stage_b":
+        if model.startswith("stage_b_"):
             continue
         cmd += ["--student-ckpt", f"{model}={exp_dir(fold, model) / 'best.pt'}"]
     run_cmd(cmd)
@@ -492,7 +505,7 @@ def discover_report_models() -> list[str]:
     if not per_fold:
         return []
     common = set.intersection(*per_fold)
-    ordered = [e.paper_id for e in EXPERIMENTS] + ["stage_b"]
+    ordered = [e.paper_id for e in EXPERIMENTS] + ["stage_b_raw", "stage_b_adapted"]
     return [m for m in ordered if m in common]
 
 
@@ -575,11 +588,11 @@ def selected_folds() -> list[int]:
 def main() -> int:
     KFOLD_ROOT.mkdir(parents=True, exist_ok=True)
     experiments = selected_experiments()
-    need_stage_a, need_stage_b = teacher_stage_requirements(experiments)
+    need_stage_a, stage_b_variants = teacher_stage_requirements(experiments)
     folds = selected_folds()
     print(
         f"[kfold] experiments={[e.paper_id for e in experiments]} folds={folds} "
-        f"need_stage_a={need_stage_a} need_stage_b={need_stage_b}",
+        f"need_stage_a={need_stage_a} stage_b_variants={sorted(stage_b_variants)}",
         flush=True,
     )
 
@@ -587,14 +600,17 @@ def main() -> int:
     if need_stage_a:
         run_stage_a()
     else:
-        print("[stage-a] skip (no selected experiment uses a Stage-A/B teacher)", flush=True)
-    if not need_stage_b:
+        print("[stage-a] skip (no selected experiment uses an adapted teacher)", flush=True)
+    if not stage_b_variants:
         print("[stage-b] skip (no selected experiment uses a Stage-B teacher)", flush=True)
 
     for fold in folds:
-        stage_b_ckpt = run_stage_b(fold) if need_stage_b else None
+        stage_b_ckpts = (
+            {v: run_stage_b(fold, v) for v in sorted(stage_b_variants)} if stage_b_variants else {}
+        )
         for exp in experiments:
-            run_stage_c(fold, exp, stage_b_ckpt if exp.teacher_mode == "stage_b" else None)
+            ckpt = stage_b_ckpts.get(exp.teacher_ckpt) if exp.teacher_mode == "stage_b" else None
+            run_stage_c(fold, exp, ckpt)
         run_eval(fold)
 
     if os.environ.get("SKIP_AGGREGATE", "").strip().lower() in ("1", "true", "yes"):

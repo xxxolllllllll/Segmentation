@@ -1311,7 +1311,7 @@ def main() -> None:
         teacher = load_teacher(args, device=device)
         teacher_dim = teacher_feature_dim(teacher)
         if args.teacher_mode == "stage_b":
-            teacher_target_channels = (128, 192, 256)
+            teacher_target_channels = (256, 256, 256)  # FPN p3/p4/p5 (all fpn-width)
             targets_fn = BridgeTeacherTargets().to(device)
         else:
             teacher_target_channels = (2 * teacher_dim, 2 * teacher_dim, 2 * teacher_dim)

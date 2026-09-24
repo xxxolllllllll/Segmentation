@@ -39,7 +39,7 @@ class StudentChannelAlign(nn.Module):
             in_channels: 三元组，依次为 P3、P4、P5 的输入通道数。
             out_channels: 投影后的通道数，需与教师目标特征通道数一致。
                 可为单一 int（三层相同，如 768/1536），也可为三元组（逐层不同，
-                如 Stage-B bridge 的 (128,192,256)）。
+                如 Stage-B FPN 金字塔的 (256,256,256)）。
         """
         super().__init__()
         if isinstance(out_channels, int):
@@ -279,11 +279,11 @@ class ConcatTeacherTargets(nn.Module):
 
 class BridgeTeacherTargets(nn.Module):
     """
-    Stage-B bridge 特征作为蒸馏目标（S3/S3_attn 使用）。
+    Stage-B FPN 金字塔特征作为蒸馏目标（S3/S3_attn 使用）。
 
-    输入三张 bridge 特征图（均为 H/16，通道 128/192/256），映射到学生
-    P3/P4/P5 尺度：low->P3（上采样）、mid->P4（同尺度）、deep->P5（下采样）。
-    无可学习参数。
+    输入三张 FPN 特征图 ``[p3, p4, p5]``（H/8、H/16、H/32，通道 256/256/256），
+    映射到学生 P3/P4/P5 尺度：p3->P3（H/8）、p4->P4（H/16）、p5->P5（H/32）。
+    尺度已对齐时插值为恒等。无可学习参数。
     """
 
     def forward(
