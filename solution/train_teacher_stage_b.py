@@ -1002,6 +1002,8 @@ def main() -> None:
 
     epoch_metrics_csv = args.output_dir / "epoch_metrics.csv"
     prepare_epoch_metrics_csv(epoch_metrics_csv)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     last_epoch = start_epoch - 1
     for epoch in range(start_epoch, args.epochs + 1):
         last_epoch = epoch
@@ -1026,6 +1028,14 @@ def main() -> None:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            if device.type == "cuda" and epoch == start_epoch and bi == 1:
+                peak_alloc = torch.cuda.max_memory_allocated() / 1e9
+                peak_reserved = torch.cuda.max_memory_reserved() / 1e9
+                print(
+                    f"[mem] peak after step 1: allocated={peak_alloc:.2f} GB, reserved={peak_reserved:.2f} GB "
+                    f"(batch={args.batch_size}, imgsz={args.imgsz})",
+                    flush=True,
+                )
             train_sum += float(loss.detach().cpu().item())
             n_train += 1
             if bi % args.log_every == 0:
