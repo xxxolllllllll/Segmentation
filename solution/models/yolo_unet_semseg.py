@@ -53,6 +53,9 @@ class YoloUNetDecoder(nn.Module):
             raise ValueError("in_channels must be (C3, C4, C5)")
         c3, c4, c5 = [int(c) for c in in_channels]
         d5, d4, d3, d2 = [int(c) for c in decoder_channels]
+        self.d5, self.d4, self.d3, self.d2 = d5, d4, d3, d2
+        # Decoder-side intermediate feature channels at (H/8, H/16, H/32).
+        self.feat_channels = (d3, d4, d5)
 
         self.p5_proj = ConvBlock(c5, d5)
         self.p4_proj = nn.Sequential(nn.Conv2d(c4, d4, 1, bias=False), nn.BatchNorm2d(d4), nn.SiLU(inplace=True))
@@ -63,23 +66,34 @@ class YoloUNetDecoder(nn.Module):
         self.dec1 = ConvBlock(d2, d2)
         self.head = nn.Conv2d(d2, int(num_classes), kernel_size=1)
 
-    def forward(self, feats: Sequence[torch.Tensor], out_hw: Tuple[int, int]) -> torch.Tensor:
+    def forward(
+        self,
+        feats: Sequence[torch.Tensor],
+        out_hw: Tuple[int, int],
+        return_intermediates: bool = False,
+    ):
         p3, p4, p5 = feats
-        x = self.p5_proj(p5)
+        f32 = self.p5_proj(p5)  # H/32
+        x = f32
 
         s4 = self.p4_proj(p4)
         x = F.interpolate(x, size=s4.shape[-2:], mode="bilinear", align_corners=False)
         x = self.dec4(torch.cat([x, s4], dim=1))
+        f16 = x  # H/16
 
         s3 = self.p3_proj(p3)
         x = F.interpolate(x, size=s3.shape[-2:], mode="bilinear", align_corners=False)
         x = self.dec3(torch.cat([x, s3], dim=1))
+        f8 = x  # H/8
 
         x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
         x = self.dec2(x)
         x = F.interpolate(x, size=out_hw, mode="bilinear", align_corners=False)
         x = self.dec1(x)
-        return self.head(x)
+        logits = self.head(x)
+        if return_intermediates:
+            return logits, (f8, f16, f32)
+        return logits
 
 
 def _copy_ultralytics_graph_meta(src: nn.Module, dst: nn.Module) -> None:
@@ -198,3 +212,16 @@ class YoloUNetSemanticStudent(nn.Module):
         feats = self.forward_features(x)
         logits = self.decoder(feats, out_hw=x.shape[-2:])
         return logits, feats
+
+    @property
+    def decoder_feat_channels(self) -> tuple[int, int, int]:
+        """Channels of the decoder intermediates at (H/8, H/16, H/32)."""
+        return tuple(int(c) for c in self.decoder.feat_channels)
+
+    def forward_with_decoder_feats(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Return (logits, (f8@H/8, f16@H/16, f32@H/32)) from the decoder."""
+        feats = self.forward_features(x)
+        logits, dec_feats = self.decoder(feats, out_hw=x.shape[-2:], return_intermediates=True)
+        return logits, dec_feats

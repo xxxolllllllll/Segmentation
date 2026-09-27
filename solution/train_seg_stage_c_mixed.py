@@ -1106,6 +1106,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--class-weights", type=str, default="", help="Optional CE class weights, e.g. 0.2,2.0")
     p.add_argument("--student-feat-channels", type=str, default="", help="Optional override C3,C4,C5")
+    p.add_argument(
+        "--student-feat-source",
+        type=str,
+        default="neck",
+        choices=("neck", "decoder"),
+        help="Distillation source: 'neck' P3/P4/P5 (default) or 'decoder' intermediates (H/8,H/16,H/32)",
+    )
     p.add_argument("--decoder-channels", type=str, default="256,192,128,64")
     p.add_argument("--student-arch", type=str, default="yolo_unet", choices=STUDENT_ARCHS, help="Student segmentation architecture")
     p.add_argument("--deeplab-backbone", type=str, default="resnet50", help="DeepLab backbone (resnet50/resnet101/mobilenet_v3_large)")
@@ -1299,6 +1306,8 @@ def main() -> None:
     ).to(device)
     if args.student_feat_channels.strip():
         c3, c4, c5 = [int(x.strip()) for x in args.student_feat_channels.split(",")]
+    elif args.student_feat_source == "decoder" and hasattr(student, "decoder_feat_channels"):
+        c3, c4, c5 = student.decoder_feat_channels
     else:
         c3, c4, c5 = student.neck_channels
 
@@ -1432,7 +1441,10 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             with amp_autocast(device, use_amp):
-                logits, feats = student(img)
+                if args.student_feat_source == "decoder" and hasattr(student, "forward_with_decoder_feats"):
+                    logits, feats = student.forward_with_decoder_feats(img)
+                else:
+                    logits, feats = student(img)
                 ce = ce_loss_fn(logits, mask)
                 dice = dice_loss_fn(logits, mask)
                 feat = torch.zeros((), device=device, dtype=logits.dtype)
