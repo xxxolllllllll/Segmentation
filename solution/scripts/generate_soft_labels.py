@@ -184,7 +184,8 @@ def main() -> None:
             for start in range(0, len(pending), args.batch_size):
                 chunk = pending[start : start + args.batch_size]
                 batch = torch.stack([c[2] for c in chunk], dim=0).to(device)
-                logits = [t(batch).float() for t in teachers]
+                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                    logits = [t(batch).float() for t in teachers]
                 if args.ensemble == "prob_mean":
                     probs = [torch.softmax(lg, dim=1) for lg in logits]
                     ensemble = torch.stack(probs, 0).mean(0)
