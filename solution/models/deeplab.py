@@ -10,7 +10,9 @@ class DeepLabSemanticStudent(nn.Module):
     """Torchvision DeepLabV3 for binary semantic segmentation.
 
     Trained from scratch (no pretrained / COCO weights) on 0-1 inputs; returns
-    ``(logits[B,2,H,W], ())``. The classifier is replaced for ``num_classes``.
+    ``(logits[B,2,H,W], (layer2, layer3, layer4))`` resnet features at
+    H/8, H/16, H/32 (shallow->deep) for feature distillation. The classifier is
+    replaced for ``num_classes``.
     """
 
     def __init__(
@@ -37,7 +39,31 @@ class DeepLabSemanticStudent(nn.Module):
             )
         else:
             raise ValueError(f"Unsupported DeepLab backbone: {self.backbone}")
-        self.neck_channels = (self.num_classes, self.num_classes, self.num_classes)
+        if self.backbone not in ("resnet50", "resnet101"):
+            raise ValueError("Feature distillation for DeepLab currently supports resnet50/resnet101 backbones")
+
+        # Capture resnet layer2/3/4 outputs (H/8, H/16, H/32) via forward hooks.
+        self._feat_keys = ("layer2", "layer3", "layer4")
+        self._feats: dict[str, torch.Tensor] = {}
+        bb = self.model.backbone
+        for name in self._feat_keys:
+            bb[name].register_forward_hook(self._make_hook(self._feats, name))
+        self.model.eval()
+        with torch.no_grad():
+            self._feats.clear()
+            self.model(torch.zeros(1, 3, 64, 64))
+            self.neck_channels = tuple(int(self._feats[k].shape[1]) for k in self._feat_keys)
+            self._feats.clear()
+
+    @staticmethod
+    def _make_hook(feats: dict, key: str):
+        def hook(module, inp, out):
+            feats[key] = out
+
+        return hook
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, Sequence[torch.Tensor]]:
-        return self.model(x)["out"], ()
+        self._feats.clear()
+        out = self.model(x)["out"]
+        feats = tuple(self._feats[k] for k in self._feat_keys)
+        return out, feats

@@ -26,7 +26,9 @@ class UNetSemanticStudent(nn.Module):
     """Standard U-Net (Ronneberger et al.) for binary semantic segmentation.
 
     Trained from scratch (no pretrained weights) on 0-1 inputs; returns
-    ``(logits[B,2,H,W], ())``. Input H/W must be divisible by 16 (4 pools).
+    ``(logits[B,2,H,W], (x3, x4, x5))`` where the three encoder features are at
+    H/4, H/8, H/16 (shallow->deep) for feature distillation. Input H/W must be
+    divisible by 16 (4 pools).
     """
 
     def __init__(self, num_classes: int = 2, base: int = 64, device: torch.device | None = None) -> None:
@@ -51,7 +53,8 @@ class UNetSemanticStudent(nn.Module):
         self.up4 = nn.ConvTranspose2d(b * 2, b, 2, 2)
         self.dec4 = DoubleConv(b * 2, b)
         self.head = nn.Conv2d(b, self.num_classes, 1)
-        self.neck_channels = (b * 2, b * 4, b * 8)
+        # Distillation features: encoder x3@H/4, x4@H/8, x5@H/16 (shallow->deep).
+        self.neck_channels = (b * 4, b * 8, b * 16)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, Sequence[torch.Tensor]]:
         x1 = self.inc(x)
@@ -63,4 +66,4 @@ class UNetSemanticStudent(nn.Module):
         d2 = self.dec2(torch.cat([self.up2(d1), x3], dim=1))
         d3 = self.dec3(torch.cat([self.up3(d2), x2], dim=1))
         d4 = self.dec4(torch.cat([self.up4(d3), x1], dim=1))
-        return self.head(d4), ()
+        return self.head(d4), (x3, x4, x5)
