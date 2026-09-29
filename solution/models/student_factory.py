@@ -19,6 +19,7 @@ def build_student(
     yolo_seg_cfg: str = "yolo11m-seg.yaml",
     yolo_unet_cfg: str = "yolo11m-seg.yaml",
     yolo_from_scratch: bool = False,
+    yolo_freeze_backbone: bool = False,
 ) -> torch.nn.Module:
     """Build a student segmentation model by architecture name.
 
@@ -39,6 +40,7 @@ def build_student(
             device=device,
             decoder_channels=decoder_channels,
             cfg=yolo_unet_cfg,
+            freeze_backbone=yolo_freeze_backbone,
         )
     if arch == "yolo_seg":
         from .yolo_seg_semantic import YoloSegSemanticStudent

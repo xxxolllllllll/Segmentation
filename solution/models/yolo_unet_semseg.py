@@ -177,9 +177,11 @@ class YoloUNetSemanticStudent(nn.Module):
         decoder_channels: Sequence[int] = (256, 192, 128, 64),
         *,
         cfg: str = "yolo11m-seg.yaml",
+        freeze_backbone: bool = False,
     ) -> None:
         super().__init__()
         use_scratch = weights is None or str(weights).strip() == ""
+        self.freeze_backbone = bool(freeze_backbone)
         if use_scratch:
             self.yolo, self.neck_channels = build_yolo_backbone_neck_from_cfg(cfg, device=device)
             self.init = "scratch"
@@ -187,11 +189,12 @@ class YoloUNetSemanticStudent(nn.Module):
             self.yolo, self.neck_channels = load_yolo_backbone_neck(weights, device=device)
             self.init = "pretrained"
         # Ultralytics load_checkpoint sets every parameter to requires_grad=False.
-        # Unfreeze the whole YOLO backbone/neck so the student is trained end-to-end
-        # (otherwise only the U-Net decoder would train and distillation on the neck
-        # features could not shape the student representation at all).
+        # By default we unfreeze the whole YOLO backbone/neck (end-to-end training).
+        # With ``freeze_backbone`` the pretrained backbone/neck is kept frozen and
+        # only the decoder is trained (better few-shot PEFT; avoids destroying the
+        # pretrained features).
         for p in self.yolo.parameters():
-            p.requires_grad_(True)
+            p.requires_grad_(not self.freeze_backbone)
         self.decoder = YoloUNetDecoder(self.neck_channels, num_classes=num_classes, decoder_channels=decoder_channels)
         self.num_classes = int(num_classes)
         self.last_feats: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None

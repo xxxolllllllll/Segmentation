@@ -1119,6 +1119,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--unet-base", type=int, default=64, help="UNet base channel width")
     p.add_argument("--yolo-seg-cfg", type=str, default="yolo11m-seg.yaml", help="Ultralytics YAML for the from-scratch YOLO-seg student")
     p.add_argument("--student-scratch", action="store_true", help="Build the YOLO11-Unet student from YAML (random init) instead of --student-weights")
+    p.add_argument(
+        "--student-freeze-backbone",
+        action="store_true",
+        help="Keep the pretrained YOLO backbone/neck frozen and train only the decoder (few-shot PEFT)",
+    )
     p.add_argument("--yolo-unet-cfg", type=str, default="yolo11m-seg.yaml", help="Ultralytics YAML for the from-scratch YOLO11-Unet student backbone/neck")
     p.add_argument("--resume", type=Path, default=None)
     p.add_argument("--max-steps", type=int, default=0)
@@ -1303,6 +1308,7 @@ def main() -> None:
         yolo_seg_cfg=args.yolo_seg_cfg,
         yolo_unet_cfg=args.yolo_unet_cfg,
         yolo_from_scratch=args.student_scratch,
+        yolo_freeze_backbone=args.student_freeze_backbone,
     ).to(device)
     if args.student_feat_channels.strip():
         c3, c4, c5 = [int(x.strip()) for x in args.student_feat_channels.split(",")]
@@ -1341,7 +1347,7 @@ def main() -> None:
     ce_loss_fn = nn.CrossEntropyLoss(weight=ce_weight, ignore_index=IGNORE_INDEX)
     dice_loss_fn = CrackDiceLoss(ignore_index=IGNORE_INDEX).to(device)
 
-    params = list(student.parameters())
+    params = [p for p in student.parameters() if p.requires_grad]
     if align is not None:
         params += list(align.parameters())
     if teacher_align is not None:
