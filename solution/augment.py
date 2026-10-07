@@ -72,3 +72,37 @@ def geometric_augment_pil(
         np.asarray(img), [np.asarray(mask)], prob=prob, rng=rng
     )
     return Image.fromarray(img_out), Image.fromarray(mask_out)
+
+
+def photometric_augment(
+    img: np.ndarray,
+    *,
+    rng: random.Random,
+    strength: float = 0.2,
+    blur_prob: float = 0.3,
+    noise_std: float = 6.0,
+) -> np.ndarray:
+    """Random photometric augmentation for an HxWx3 uint8 image (colour only).
+
+    brightness / contrast / gamma are sampled in ``1 ± strength``; optional
+    Gaussian blur and additive Gaussian noise add capture-condition robustness.
+    The label mask is left unchanged.
+    """
+    from PIL import ImageFilter
+
+    x = img.astype(np.float32)
+    x = x * (1.0 + rng.uniform(-strength, strength))                 # brightness
+    mean = float(x.mean())
+    x = (x - mean) * (1.0 + rng.uniform(-strength, strength)) + mean  # contrast
+    gamma = max(0.2, 1.0 + rng.uniform(-strength, strength))          # gamma
+    x = np.power(np.clip(x, 0.0, 255.0) / 255.0, gamma) * 255.0
+    if blur_prob > 0.0 and rng.random() < blur_prob:
+        radius = rng.uniform(0.4, 1.5)
+        x = np.asarray(
+            Image.fromarray(np.clip(x, 0, 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(radius)),
+            dtype=np.float32,
+        )
+    if noise_std > 0.0:
+        nprng = np.random.default_rng(rng.randrange(2 ** 32))
+        x = x + nprng.normal(0.0, noise_std, size=x.shape)
+    return np.clip(x, 0.0, 255.0).astype(np.uint8)

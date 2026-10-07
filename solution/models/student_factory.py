@@ -4,7 +4,13 @@ from typing import Sequence
 
 import torch
 
-STUDENT_ARCHS = ("yolo_unet", "yolo_seg", "unet", "deeplab")
+STUDENT_ARCHS = ("yolo_unet", "yolo_seg", "unet", "deeplab", "smgnet", "macunet_kd")
+try:  # reuse the SMG-Net repo's single-file models as extra baselines
+    from .repo_models import SPECS as _REPO_SPECS
+
+    STUDENT_ARCHS = STUDENT_ARCHS + tuple(_REPO_SPECS)
+except Exception:  # pragma: no cover
+    _REPO_SPECS = {}
 
 
 def build_student(
@@ -54,4 +60,18 @@ def build_student(
         from .deeplab import DeepLabSemanticStudent
 
         return DeepLabSemanticStudent(num_classes=num_classes, backbone=deeplab_backbone, pretrained=False, device=device)
+    if arch == "smgnet":
+        from .smgnet import SMGNetStudent
+
+        return SMGNetStudent(num_classes=num_classes, device=device)
+    if arch == "macunet_kd":
+        from .repo_models import MACUNetKDStudent
+
+        return MACUNetKDStudent(num_classes=num_classes)
+    from .repo_models import SPECS as _REPO_SPECS
+
+    if arch in _REPO_SPECS:
+        from .repo_models import RepoStudent
+
+        return RepoStudent(arch, num_classes=num_classes)
     raise ValueError(f"Unknown student arch: {arch!r}. Choose from {STUDENT_ARCHS}")

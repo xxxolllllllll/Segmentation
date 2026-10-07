@@ -35,7 +35,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from checkpoint_io import torch_load_compat  # noqa: E402
-from augment import geometric_augment  # noqa: E402
+from augment import geometric_augment, photometric_augment  # noqa: E402
 from distill_modules import (  # noqa: E402
     BridgeTeacherTargets,
     ConcatTeacherTargets,
@@ -58,6 +58,7 @@ from scripts.labelme_crack_copy_paste import (  # noqa: E402
     transform_instance,
 )
 from val_eval import (  # noqa: E402
+    CRACK_CLASS,
     aggregate_micro,
     build_gt_masks,
     compute_crack_metrics,
@@ -394,6 +395,12 @@ class LabelMeStageCDataset(Dataset):
         copy_paste_scale_max: float,
         copy_paste_alpha_dilate: int,
         copy_paste_alpha_blur: int,
+        scale_aug_min: float = 1.0,
+        scale_aug_max: float = 1.0,
+        photo_aug_prob: float = 0.0,
+        photo_aug_strength: float = 0.2,
+        photo_aug_blur_prob: float = 0.3,
+        photo_aug_noise_std: float = 6.0,
     ) -> None:
         self.entries = entries
         self.is_positive_mask = is_positive_mask
@@ -423,6 +430,12 @@ class LabelMeStageCDataset(Dataset):
         self.copy_paste_scale_max = float(copy_paste_scale_max)
         self.copy_paste_alpha_dilate = int(copy_paste_alpha_dilate)
         self.copy_paste_alpha_blur = int(copy_paste_alpha_blur)
+        self.scale_aug_min = float(scale_aug_min)
+        self.scale_aug_max = float(scale_aug_max)
+        self.photo_aug_prob = float(photo_aug_prob)
+        self.photo_aug_strength = float(photo_aug_strength)
+        self.photo_aug_blur_prob = float(photo_aug_blur_prob)
+        self.photo_aug_noise_std = float(photo_aug_noise_std)
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -443,11 +456,35 @@ class LabelMeStageCDataset(Dataset):
         )
         ignore_eff = effective_ignore(ignore, component)
 
-        image_p = crop_top_left_rgb(image_np, y0, x0, self.window_size, self.window_size)
-        crack_p = crop_top_left_2d(crack, y0, x0, self.window_size, self.window_size, False)
-        component_p = crop_top_left_2d(component, y0, x0, self.window_size, self.window_size, False)
-        ignore_p = crop_top_left_2d(ignore_eff, y0, x0, self.window_size, self.window_size, True)
-        other_p = crop_top_left_2d(other, y0, x0, self.window_size, self.window_size, False)
+        crop, cy0, cx0 = self.window_size, y0, x0
+        if self.train and self.scale_aug_max > self.scale_aug_min >= 0.0:
+            # scale augmentation: crop a larger/smaller region, then resize to imgsz later.
+            # Retry a few scales; fall back to the unscaled window to avoid all-ignore crops.
+            center_y = y0 + self.window_size / 2.0
+            center_x = x0 + self.window_size / 2.0
+            for _ in range(4):
+                scale = self.rng.uniform(self.scale_aug_min, self.scale_aug_max)
+                c = max(32, int(round(self.window_size * scale)))
+                cyy = max(0, min(int(round(center_y - c / 2.0)), max(0, h - c)))
+                cxx = max(0, min(int(round(center_x - c / 2.0)), max(0, w - c)))
+                if bool(component[cyy:cyy + c, cxx:cxx + c].any()):
+                    crop, cy0, cx0 = c, cyy, cxx
+                    break
+
+        image_p = crop_top_left_rgb(image_np, cy0, cx0, crop, crop)
+        crack_p = crop_top_left_2d(crack, cy0, cx0, crop, crop, False)
+        component_p = crop_top_left_2d(component, cy0, cx0, crop, crop, False)
+        ignore_p = crop_top_left_2d(ignore_eff, cy0, cx0, crop, crop, True)
+        other_p = crop_top_left_2d(other, cy0, cx0, crop, crop, False)
+
+        if self.train and self.photo_aug_prob > 0.0 and self.rng.random() < self.photo_aug_prob:
+            image_p = photometric_augment(
+                image_p,
+                rng=self.rng,
+                strength=self.photo_aug_strength,
+                blur_prob=self.photo_aug_blur_prob,
+                noise_std=self.photo_aug_noise_std,
+            )
 
         can_copy_paste = (
             self.train
@@ -483,7 +520,7 @@ class LabelMeStageCDataset(Dataset):
                 alpha_blur=self.copy_paste_alpha_blur,
             )
 
-        mask_p = np.zeros((self.window_size, self.window_size), dtype=np.uint8)
+        mask_p = np.zeros(crack_p.shape, dtype=np.uint8)
         mask_p[crack_p] = 1
         mask_p[ignore_p] = IGNORE_INDEX
 
@@ -605,19 +642,38 @@ def soft_label_kd_loss(
     *,
     temp: float,
     conf_thresh: float,
+    mask_mode: str = "conf",
+    crack_thresh: float = 0.3,
+    band_lo: float = 0.3,
+    band_hi: float = 0.7,
+    weight_by_prob: bool = False,
 ) -> torch.Tensor:
-    """Temperature-scaled KD against cached teacher crack logits, masked by confidence."""
+    """Temperature-scaled KD against cached teacher crack logits.
+
+    ``mask_mode``:
+      - ``"conf"``  legacy: keep pixels with max(p, 1-p) > conf_thresh (keeps ~all background)
+      - ``"crack"`` keep only teacher-crack pixels with p >= crack_thresh (ignore background)
+      - ``"band"``  keep only uncertain pixels with band_lo <= p <= band_hi
+    ``weight_by_prob`` additionally weights kept pixels by the teacher crack probability p.
+    """
     logits = student_logits.float()
     tgt_logit = soft_logit.float()
-    if tgt_logit.dim() == 4 and tgt_logit.shape[1] == 1:
+    single_channel = tgt_logit.dim() == 4 and tgt_logit.shape[1] == 1
+    if single_channel:
         p = torch.sigmoid(tgt_logit[:, 0])
     else:
         p = torch.softmax(tgt_logit, dim=1)[:, 1]
-    conf = torch.maximum(p, 1.0 - p)
-    mask = (conf > conf_thresh).float()
-    if float(mask.sum()) < 1.0:
+    if mask_mode == "crack":
+        mask = (p >= crack_thresh).float()
+    elif mask_mode == "band":
+        mask = ((p >= band_lo) & (p <= band_hi)).float()
+    else:
+        mask = (torch.maximum(p, 1.0 - p) > conf_thresh).float()
+    if weight_by_prob:
+        mask = mask * p
+    if float(mask.sum()) < 1e-6:
         return logits.sum() * 0.0
-    if tgt_logit.dim() == 4 and tgt_logit.shape[1] == 1:
+    if single_channel:
         target = torch.sigmoid(tgt_logit[:, 0] / temp)
         d = (logits[:, 1] - logits[:, 0]) / temp
         loss = F.binary_cross_entropy_with_logits(d, target, reduction="none") * (temp * temp)
@@ -866,6 +922,33 @@ def resize_mask(mask: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     return F.interpolate(mask[:, None].float(), size=size, mode="nearest").squeeze(1)
 
 
+@torch.no_grad()
+def predict_student_prob_map(
+    model: nn.Module,
+    image_rgb: np.ndarray,
+    *,
+    imgsz: int,
+    stride: int,
+    num_classes: int,
+    device: torch.device,
+) -> np.ndarray:
+    """Stitched crack probability (H, W) for the whole image (same windowing as predict_student_mask)."""
+    from val_eval import crop_bottom_right_pad, image_to_tensor_01, sliding_starts
+
+    h, w = image_rgb.shape[:2]
+    prob_sum = np.zeros((h, w), dtype=np.float32)
+    count = np.zeros((h, w), dtype=np.float32)
+    for y in sliding_starts(h, imgsz, stride):
+        for x in sliding_starts(w, imgsz, stride):
+            patch, crop_w, crop_h = crop_bottom_right_pad(image_rgb, x, y, imgsz)
+            tensor = image_to_tensor_01(patch).unsqueeze(0).to(device)
+            logits, _ = model(tensor)
+            prob = F.softmax(logits.float(), dim=1)[0, 1, :crop_h, :crop_w].cpu().numpy()
+            prob_sum[y:y + crop_h, x:x + crop_w] += prob
+            count[y:y + crop_h, x:x + crop_w] += 1.0
+    return prob_sum / np.maximum(count, 1.0)
+
+
 def masked_smooth_l1(student: torch.Tensor, teacher: torch.Tensor, valid: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     if valid.dim() == 3:
         valid = valid[:, None]
@@ -921,9 +1004,14 @@ def compute_distill_losses(
     target_sizes = [(s.shape[2], s.shape[3]) for s in s_feats]
     x_t = F.interpolate(images_01, size=(teacher_img_size, teacher_img_size), mode="bilinear", align_corners=False)
     x_t = imagenet_normalize(x_t)
+    try:
+        p = next(teacher.parameters())
+        x_t = x_t.to(p.dtype)
+    except StopIteration:
+        pass
     with torch.no_grad():
-        t_feats = extract_teacher_feature_maps(teacher, x_t, teacher_mode)
-    t_targets = targets_fn(t_feats, target_sizes)
+        t_feats = [t.float() for t in extract_teacher_feature_maps(teacher, x_t, teacher_mode)]
+    t_targets = [t.float() for t in targets_fn(t_feats, target_sizes)]
     t_targets = teacher_align(t_targets)  # unify teachers into the shared D space
     if feat_norm not in ("none", ""):
         s_feats = [standardize_feature(s, feat_norm) for s in s_feats]
@@ -1047,7 +1135,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--soft-image-roots", type=Path, nargs="+", default=None, help="Unlabeled image roots matching the soft labels")
     p.add_argument("--lambda-soft", type=float, default=0.0, help="Weight of the soft-label KD term (0 disables)")
     p.add_argument("--soft-temp", type=float, default=2.0)
-    p.add_argument("--soft-conf-thresh", type=float, default=0.7, help="Only distill pixels with teacher confidence above this")
+    p.add_argument("--soft-conf-thresh", type=float, default=0.7, help="conf mode: keep pixels with max(p,1-p) above this")
+    p.add_argument(
+        "--soft-mask-mode",
+        type=str,
+        default="conf",
+        choices=("conf", "crack", "band"),
+        help="Soft-KD pixel mask: conf (legacy), crack (p>=thresh, ignore background), band (uncertain band)",
+    )
+    p.add_argument("--soft-crack-thresh", type=float, default=0.3, help="crack mode: keep teacher crack prob >= this")
+    p.add_argument("--soft-band-lo", type=float, default=0.3, help="band mode: lower crack-prob bound")
+    p.add_argument("--soft-band-hi", type=float, default=0.7, help="band mode: upper crack-prob bound")
+    p.add_argument("--soft-weight-by-prob", action="store_true", help="Weight soft-KD pixels by teacher crack prob")
     p.add_argument("--soft-batch-size", type=int, default=0, help="0 = same as --batch-size-curated")
     p.add_argument("--soft-num-workers", type=int, default=0)
     p.add_argument("--window-size", type=int, default=0, help="0 = use --imgsz")
@@ -1076,6 +1175,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--copy-paste-scale-max", type=float, default=1.1)
     p.add_argument("--copy-paste-alpha-dilate", type=int, default=3)
     p.add_argument("--copy-paste-alpha-blur", type=int, default=7)
+    p.add_argument("--scale-aug-min", type=float, default=1.0,
+                   help="Random scale augmentation lower bound (crop side = window_size*scale); 1.0 disables")
+    p.add_argument("--scale-aug-max", type=float, default=1.0,
+                   help="Random scale augmentation upper bound (>min enables train-time scale jitter)")
+    p.add_argument("--photo-aug-prob", type=float, default=0.0,
+                   help="Probability of applying photometric augmentation per train sample (0 disables)")
+    p.add_argument("--photo-aug-strength", type=float, default=0.2,
+                   help="Brightness/contrast/gamma sampled in 1±strength")
+    p.add_argument("--photo-aug-blur-prob", type=float, default=0.3)
+    p.add_argument("--photo-aug-noise-std", type=float, default=6.0)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size-curated", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -1086,6 +1195,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fold", type=int, default=0, help="Held-out fold index (0-based) when --fold-split is set.")
     p.add_argument("--early-stop-patience", type=int, default=10, help="Early stop on val crack IoU patience.")
     p.add_argument("--val-stride", type=int, default=512, help="Sliding-window stride for image-level val IoU.")
+    p.add_argument("--val-calibrate-threshold", action="store_true",
+                   help="Sweep decision thresholds on the val set each epoch and early-stop on the best-IoU threshold")
+    p.add_argument("--val-thresholds", type=str, default="0.05,0.08,0.1,0.15,0.2,0.3,0.4,0.5")
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--persistent-workers", action="store_true", help="Keep DataLoader workers alive between epochs (num_workers>0)")
     p.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor (num_workers>0 only)")
@@ -1126,6 +1238,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--yolo-unet-cfg", type=str, default="yolo11m-seg.yaml", help="Ultralytics YAML for the from-scratch YOLO11-Unet student backbone/neck")
     p.add_argument("--resume", type=Path, default=None)
+    p.add_argument("--reset-patience", action="store_true",
+                   help="When resuming, reset the early-stop patience counter to 0 (continue training with a fresh window)")
     p.add_argument("--max-steps", type=int, default=0)
     p.add_argument("--max-val-batches", type=int, default=0)
     p.add_argument("--log-every", type=int, default=10)
@@ -1234,6 +1348,12 @@ def main() -> None:
         copy_paste_scale_max=args.copy_paste_scale_max,
         copy_paste_alpha_dilate=args.copy_paste_alpha_dilate,
         copy_paste_alpha_blur=args.copy_paste_alpha_blur,
+        scale_aug_min=args.scale_aug_min,
+        scale_aug_max=args.scale_aug_max,
+        photo_aug_prob=args.photo_aug_prob,
+        photo_aug_strength=args.photo_aug_strength,
+        photo_aug_blur_prob=args.photo_aug_blur_prob,
+        photo_aug_noise_std=args.photo_aug_noise_std,
     )
 
     sampler = None
@@ -1293,7 +1413,9 @@ def main() -> None:
             collate_fn=collate_soft,
             drop_last=True,
         )
-        print(f"[soft] enabled: {len(soft_ds)} windows, batch={soft_bs}, temp={args.soft_temp}, conf>{args.soft_conf_thresh}", flush=True)
+        print(f"[soft] enabled: {len(soft_ds)} windows, batch={soft_bs}, temp={args.soft_temp}, "
+              f"mask={args.soft_mask_mode} crack_thresh={args.soft_crack_thresh} "
+              f"weight_by_prob={args.soft_weight_by_prob}", flush=True)
 
     decoder_channels = parse_float_list(args.decoder_channels, 4, "--decoder-channels")
     assert decoder_channels is not None
@@ -1324,6 +1446,9 @@ def main() -> None:
     teacher_dim: int | None = None
     if use_teacher:
         teacher = load_teacher(args, device=device)
+        if not use_amp:
+            teacher = teacher.float()
+        teacher.eval()
         teacher_dim = teacher_feature_dim(teacher)
         if args.teacher_mode == "stage_b":
             teacher_target_channels = (256, 256, 256)  # FPN p3/p4/p5 (all fpn-width)
@@ -1388,6 +1513,9 @@ def main() -> None:
                 f"recovered best_epoch={best_epoch} patience_counter={patience_counter}",
                 flush=True,
             )
+        if args.reset_patience:
+            patience_counter = 0
+            print("[resume] --reset-patience: patience counter reset to 0", flush=True)
         print(
             f"[resume] {resume_path} -> start_epoch={start_epoch} best_val={best_val:.4f} "
             f"best_epoch={best_epoch} patience_counter={patience_counter}",
@@ -1425,6 +1553,7 @@ def main() -> None:
     if args.debug_distill_steps > 0:
         # Reproducible data order / augmentation for cross-teacher diagnostics.
         set_seed(args.seed)
+    nonfinite_steps = 0
     for epoch in range(start_epoch, args.epochs + 1):
         last_epoch = epoch
         student.train()
@@ -1487,7 +1616,15 @@ def main() -> None:
                     soft_tgt = soft_batch["soft_logit"].to(device, non_blocking=True)
                     soft_logits, _ = student(soft_img)
                     soft_loss = soft_label_kd_loss(
-                        soft_logits, soft_tgt, temp=args.soft_temp, conf_thresh=args.soft_conf_thresh
+                        soft_logits,
+                        soft_tgt,
+                        temp=args.soft_temp,
+                        conf_thresh=args.soft_conf_thresh,
+                        mask_mode=args.soft_mask_mode,
+                        crack_thresh=args.soft_crack_thresh,
+                        band_lo=args.soft_band_lo,
+                        band_hi=args.soft_band_hi,
+                        weight_by_prob=args.soft_weight_by_prob,
                     )
 
                 total = (
@@ -1509,6 +1646,22 @@ def main() -> None:
                     lambda_feat=args.lambda_feat_curated,
                     lambda_attn=args.lambda_attn_curated,
                 )
+
+            if not torch.isfinite(total):
+                # Guard against degenerate batches (e.g. all-ignore windows -> NaN CE,
+                # or fp16/bf16 AMP instability). Warn loudly instead of failing silently.
+                nonfinite_steps += 1
+                if nonfinite_steps == 1 or nonfinite_steps % 25 == 0:
+                    print(f"[warn] non-finite loss at epoch {epoch} batch {bi} "
+                          f"(total non-finite steps so far: {nonfinite_steps}); skipping step", flush=True)
+                optimizer.zero_grad(set_to_none=True)
+                if nonfinite_steps >= 25:
+                    raise RuntimeError(
+                        f"too many consecutive non-finite losses ({nonfinite_steps}); aborting run "
+                        f"(try --no-amp or check the model/data)"
+                    )
+                continue
+            nonfinite_steps = 0
 
             scaler.scale(total).backward()
             scaler.step(optimizer)
@@ -1533,6 +1686,12 @@ def main() -> None:
 
         student.eval()
         val_metrics = []
+        val_thresholds = (
+            [float(t) for t in args.val_thresholds.split(",") if t.strip()]
+            if args.val_calibrate_threshold else []
+        )
+        val_thr_acc = {t: [0, 0, 0] for t in val_thresholds}
+        val_threshold_used = 0.5
         with torch.no_grad():
             for vi, (ann_path, img_path) in enumerate(val_samples, start=1):
                 if args.max_val_batches > 0 and vi > args.max_val_batches:
@@ -1550,22 +1709,47 @@ def main() -> None:
                 )
                 if not bool(valid.any()):
                     continue
-                pred = predict_student_mask(
-                    student,
-                    image_rgb,
-                    imgsz=args.imgsz,
-                    stride=args.val_stride,
-                    num_classes=args.num_classes,
-                    device=device,
-                )
-                val_metrics.append(compute_crack_metrics(gt, pred, valid))
-        mean_val_iou = aggregate_micro(val_metrics).iou if val_metrics else 0.0
+                if val_thresholds:
+                    prob = predict_student_prob_map(
+                        student,
+                        image_rgb,
+                        imgsz=args.imgsz,
+                        stride=args.val_stride,
+                        num_classes=args.num_classes,
+                        device=device,
+                    )
+                    gt_c = (gt == CRACK_CLASS) & valid
+                    for thr in val_thresholds:
+                        pred_c = (prob >= thr) & valid
+                        val_thr_acc[thr][0] += int(np.logical_and(gt_c, pred_c).sum())
+                        val_thr_acc[thr][1] += int(np.logical_and(~gt_c, pred_c).sum())
+                        val_thr_acc[thr][2] += int(np.logical_and(gt_c, ~pred_c).sum())
+                else:
+                    pred = predict_student_mask(
+                        student,
+                        image_rgb,
+                        imgsz=args.imgsz,
+                        stride=args.val_stride,
+                        num_classes=args.num_classes,
+                        device=device,
+                    )
+                    val_metrics.append(compute_crack_metrics(gt, pred, valid))
+        if val_thresholds and val_thr_acc:
+            def _thr_iou(acc: list[int]) -> float:
+                tp, fp, fn = acc
+                return tp / max(tp + fp + fn, 1e-9)
+            best_t = max(val_thresholds, key=lambda t: _thr_iou(val_thr_acc[t]))
+            mean_val_iou = _thr_iou(val_thr_acc[best_t])
+            val_threshold_used = float(best_t)
+        else:
+            mean_val_iou = aggregate_micro(val_metrics).iou if val_metrics else 0.0
 
         print(
             f"Epoch {epoch}/{args.epochs} train_total={running['total']/max(n_batches,1):.4f} "
             f"train_ce={running['ce']/max(n_batches,1):.4f} train_dice={running['dice']/max(n_batches,1):.4f} "
             f"train_feat={running['feat']/max(n_batches,1):.4f} train_attn={running['attn']/max(n_batches,1):.4f} "
-            f"val_iou={mean_val_iou:.4f}",
+            f"val_iou={mean_val_iou:.4f}"
+            + (f" val_thr={val_threshold_used:.2f}" if val_thresholds else ""),
             flush=True,
         )
 
@@ -1605,6 +1789,7 @@ def main() -> None:
             "model_type": f"student_{args.student_arch}",
             "student_arch": args.student_arch,
             "valid_region": "component_mask & (mask != 255)",
+            "val_threshold": float(val_threshold_used),
         }
         torch.save(ckpt, args.output_dir / "last.pt")
         if improved:
